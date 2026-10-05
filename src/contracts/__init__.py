@@ -1,1 +1,47 @@
-"""contracts (see docs/MANDATE.md)."""
+"""contracts (see docs/MANDATE.md and docs/contracts.md)."""
+
+from contracts.messages import (
+    AWARENESS_DECISIONS,
+    PAYLOAD_TYPES,
+    SCHEMA_VERSION,
+    ActionProposal,
+    AwarenessDecision,
+    ContractError,
+    Envelope,
+    ExperimentEvent,
+    LearningEvent,
+    MemoryQuery,
+    MemoryResult,
+    Observation,
+    Outcome,
+    Payload,
+    PlanProposal,
+    PredictionRequest,
+    PredictionResult,
+    SafetyDecision,
+    StateUpdate,
+    Uncertainty,
+)
+
+__all__ = [
+    "AWARENESS_DECISIONS",
+    "PAYLOAD_TYPES",
+    "SCHEMA_VERSION",
+    "ActionProposal",
+    "AwarenessDecision",
+    "ContractError",
+    "Envelope",
+    "ExperimentEvent",
+    "LearningEvent",
+    "MemoryQuery",
+    "MemoryResult",
+    "Observation",
+    "Outcome",
+    "Payload",
+    "PlanProposal",
+    "PredictionRequest",
+    "PredictionResult",
+    "SafetyDecision",
+    "StateUpdate",
+    "Uncertainty",
+]
