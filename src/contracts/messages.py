@@ -185,11 +185,7 @@ class _Contract:
 
     @classmethod
     def from_json(cls, text: str) -> Any:
-        try:
-            raw = json.loads(text, parse_constant=_reject_constant)
-        except json.JSONDecodeError as exc:
-            raise ContractError(f"{cls.__name__}: invalid JSON: {exc}") from exc
-        return _decode_dataclass(raw, cls, cls.__name__)
+        return _decode_dataclass(_load_json(text, cls.__name__), cls, cls.__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -544,12 +540,22 @@ class Envelope(_Contract):
 
     @classmethod
     def from_json(cls, text: str) -> "Envelope":
-        try:
-            raw = json.loads(text, parse_constant=_reject_constant)
-        except json.JSONDecodeError as exc:
-            raise ContractError(f"Envelope: invalid JSON: {exc}") from exc
-        return cls.from_dict(raw)
+        return cls.from_dict(_load_json(text, "Envelope"))
 
 
 def _reject_constant(name: str) -> Any:
     raise ContractError(f"non-finite number {name!r} in JSON")
+
+
+def _load_json(text: Any, path: str) -> Any:
+    """Parse wire JSON; every malformed input surfaces as ``ContractError``.
+
+    Only ``str`` is accepted: the wire format is text, and bytes, dicts or other
+    objects passed by mistake must not leak ``TypeError`` past the contract.
+    """
+    if not isinstance(text, str):
+        raise ContractError(f"{path}: expected JSON text (str), got {type(text).__name__}")
+    try:
+        return json.loads(text, parse_constant=_reject_constant)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ContractError(f"{path}: invalid JSON: {exc}") from exc

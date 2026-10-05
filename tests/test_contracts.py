@@ -288,6 +288,15 @@ def test_invalid_json_raises():
         Envelope.from_json("{not json")
     with pytest.raises(ContractError):
         Envelope.from_json("[]")
+    with pytest.raises(ContractError):
+        Envelope.from_json("[" * 100_000)
+
+
+@pytest.mark.parametrize("value", [None, 7, {"a": 1}, ["x"], b"{}"])
+@pytest.mark.parametrize("from_json", [Envelope.from_json, Observation.from_json])
+def test_from_json_rejects_non_string_input(value, from_json):
+    with pytest.raises(ContractError, match="expected JSON text"):
+        from_json(value)
 
 
 # --- semantic constraints --------------------------------------------------

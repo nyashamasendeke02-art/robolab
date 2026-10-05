@@ -24,7 +24,9 @@ or field below must bump the version and update this document.
   Each payload class also has `to_json()` / `from_json()` for the bare payload. Tuples
   are encoded as arrays, `None` as `null`. Decoding rejects missing fields, unknown
   extra fields, wrong types, non-finite numbers, unknown message types and schema
-  version mismatches.
+  version mismatches. `from_json()` accepts only `str`; any other input (`None`,
+  numbers, `bytes`, already-parsed dicts/lists) and malformed or excessively nested
+  JSON raise `ContractError` rather than leaking `TypeError`/`RecursionError`.
 - Free-form string enumerations are closed: values outside the listed set are rejected.
 
 ### Envelope
