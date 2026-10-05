@@ -287,6 +287,24 @@ def test_telemetry_failure_latches_estop(tmp_path):
     assert k.estopped and k.telemetry_failures >= 1
 
 
+def test_unlogged_reset_keeps_estop_latched(tmp_path):
+    with TelemetryLog(tmp_path / "capped.jsonl", max_bytes=1) as log:
+        k = SafetyKernel(_config(), log, KEY, clock=Clock())
+        k.emergency_stop("test", now=T0)
+        assert k.reset_emergency_stop(KEY, now=T0 + 0.1) is False
+        assert k.estopped
+        r = _check(k, _cmd((1.0, 1.0), ts=T0 + 0.1), now=T0 + 0.1)
+    assert r.decision.verdict == "emergency_stop"
+    assert r.actuator_command == (0.0, 0.0)
+
+
+def test_logged_reset_returns_true(tl):
+    k = _kernel(tl)
+    k.emergency_stop("test", now=T0)
+    assert k.reset_emergency_stop(KEY, now=T0 + 0.1) is True
+    assert not k.estopped
+
+
 # 7. Immutable limits -------------------------------------------------------
 
 

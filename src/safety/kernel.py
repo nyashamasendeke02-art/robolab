@@ -32,7 +32,8 @@ Every call returns a :class:`KernelResult` holding the contract
 the action that may reach the actuators: ``approved_action`` on approve and
 the configured safe action (zero force) otherwise. Every decision is written to
 the telemetry log (component ``"safety"``). If telemetry cannot be written the
-kernel latches the emergency stop, since an unobservable kernel is not safe.
+kernel latches the emergency stop, since an unobservable kernel is not safe;
+for the same reason an operator reset that cannot be logged is not applied.
 
 Workspace prediction model (deterministic, not learned): each action component
 is a force on the matching Cartesian axis of a point mass ``mass_kg``; over one
@@ -296,9 +297,12 @@ class SafetyKernel:
             self._set("_estop_reason", str(reason) or "unspecified")
         return self._emit(self._estop_result("estop", now), t0)
 
-    def reset_emergency_stop(self, operator_key: str, now: Optional[float] = None) -> None:
+    def reset_emergency_stop(self, operator_key: str, now: Optional[float] = None) -> bool:
         """Operator API: clear the e-stop latch. Raises PermissionError on a bad key.
 
+        Returns True when the latch was cleared. The reset is only applied once
+        it has been logged: if telemetry cannot record it the latch stays set
+        and False is returned (an unobservable reset is not a safe reset).
         Commands timestamped before the reset are rejected afterwards, and the
         watchdog restarts from the reset time.
         """
@@ -306,7 +310,7 @@ class SafetyKernel:
         ok = isinstance(operator_key, str) and hmac.compare_digest(
             operator_key.encode("utf-8"), self._operator_key.encode("utf-8")
         )
-        self._log_event(
+        logged = self._log_event(
             now,
             decision="estop_reset" if ok else "estop_reset_denied",
             reason="operator reset" if ok else "invalid operator key",
@@ -314,9 +318,14 @@ class SafetyKernel:
         )
         if not ok:
             raise PermissionError("invalid operator key; e-stop remains latched")
+        if not logged:
+            if self._estop_reason is None:
+                self._set("_estop_reason", C_TELEMETRY)
+            return False
         self._set("_estop_reason", None)
         self._set("_last_reset_time", now)
         self._set("_last_valid_time", now)
+        return True
 
     # -- internals -----------------------------------------------------------
 
