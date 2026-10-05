@@ -201,6 +201,36 @@ def test_wrong_type_on_construction_raises():
         Observation(sensor_id="s", channels=["a"], values=(1.0,), uncertainty=Uncertainty())
 
 
+def test_int_where_float_expected_raises_on_construction():
+    with pytest.raises(ContractError, match="expected float"):
+        Observation(sensor_id="s", channels=("a",), values=(1,), uncertainty=Uncertainty())
+    with pytest.raises(ContractError, match="expected float"):
+        make_envelope(SAMPLES["Observation"], timestamp=1)
+    with pytest.raises(ContractError, match="expected float"):
+        Uncertainty(model=0)
+    with pytest.raises(ContractError, match="expected float"):
+        PredictionRequest(variables=(), state=(), action=(), horizon_steps=1, dt=1)
+
+
+@pytest.mark.parametrize(
+    "path, value",
+    [
+        (("timestamp",), 12),
+        (("payload", "confidence"), 1),
+        (("payload", "action"), [1, 0.5]),
+        (("payload", "uncertainty", "policy"), 0),
+    ],
+)
+def test_int_where_float_expected_raises_from_json(path, value):
+    d = envelope_dict()
+    target = d
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ContractError, match="expected float"):
+        Envelope.from_json(json.dumps(d))
+
+
 @pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
 def test_non_finite_in_json_raises(token):
     text = make_envelope(SAMPLES["ActionProposal"]).to_json()

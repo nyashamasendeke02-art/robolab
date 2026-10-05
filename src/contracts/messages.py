@@ -71,7 +71,10 @@ def _check(value: Any, tp: Any, path: str) -> None:
         if isinstance(value, bool) or not isinstance(value, int):
             raise ContractError(f"{path}: expected int, got {type(value).__name__}")
     elif tp is float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        # Strict: ints (and bools) are rejected rather than silently retained,
+        # so a float field always holds a float. JSON written by ``to_json``
+        # always encodes floats with a decimal point / exponent.
+        if not isinstance(value, float):
             raise ContractError(f"{path}: expected float, got {type(value).__name__}")
         if not math.isfinite(value):
             raise ContractError(f"{path}: non-finite number {value!r}")

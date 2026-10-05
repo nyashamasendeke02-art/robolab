@@ -14,8 +14,9 @@ or field below must bump the version and update this document.
   message cannot be created. `validate()` may also be called explicitly. Every
   violation raises `contracts.ContractError` (a `ValueError` subclass).
 - Allowed field types: `str`, `int`, `float`, `bool`, `Uncertainty`, `Optional[...]`
-  and `tuple[X, ...]`. `bool` is not accepted where an `int` or `float` is expected; an
-  `int` is accepted where a `float` is expected. Every `float` must be finite (NaN and
+  and `tuple[X, ...]`. `bool` is not accepted where an `int` or `float` is expected, and
+  an `int` is not accepted where a `float` is expected (write `1.0`, not `1`, both in
+  Python and in JSON; `float` and `int` are never coerced). Every `float` must be finite (NaN and
   ±Infinity are rejected both in objects and in JSON input).
 - Named vectors are expressed as parallel tuples (for example `variables` / `values`)
   that must have equal length. Mappings are not used, so messages stay immutable.
