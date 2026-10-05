@@ -314,6 +314,37 @@ def test_kernel_limits_cannot_be_rebound(tl):
     assert _check(k, _cmd((11.0, 0.0))).decision.verdict == "reject"
 
 
+def test_estop_latch_cannot_be_cleared_by_attribute_write(tl):
+    k = _kernel(tl)
+    k.emergency_stop("test", now=T0)
+    k._estop_reason = None
+    assert k.estopped
+    r = _check(k, _cmd((1.0, 0.0)))
+    assert r.decision.verdict == "emergency_stop"
+    assert r.actuator_command == (0.0, 0.0)
+    k.reset_emergency_stop(KEY, now=T0 + 1.0)
+    assert not k.estopped
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("_estop_reason", None),
+        ("_last_valid_time", 1e12),
+        ("_last_reset_time", -1e12),
+        ("estopped", False),
+        ("_new_attr", 1),
+    ],
+)
+def test_outside_state_write_latches_estop_and_is_logged(tl, name, value):
+    k = _kernel(tl)
+    setattr(k, name, value)
+    assert k.estopped
+    assert _check(k, _cmd((1.0, 0.0))).decision.verdict == "emergency_stop"
+    assert any(r.decision == "tamper" and name in r.reason for r in tl.records())
+    assert not hasattr(k, "_new_attr")
+
+
 def test_no_public_mutator_api(tl):
     k = _kernel(tl)
     public = {n for n in dir(k) if not n.startswith("_")}

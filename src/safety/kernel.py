@@ -5,7 +5,10 @@ final authority of the control cycle and sits outside learned authority: its
 limits are fixed at construction (:class:`SafetyConfig` is frozen, the kernel
 offers no setter) and the emergency-stop latch can only be cleared through the
 operator API (:meth:`SafetyKernel.reset_emergency_stop` with the operator key
-given at construction).
+given at construction). After construction, rebinding the limits or operator
+key raises ``AttributeError``; any other attribute write from outside the
+kernel (e.g. ``kernel._estop_reason = None``) is treated as tampering: it is
+ignored, latches the emergency stop and is logged (decision ``"tamper"``).
 
 Checks, in order (the first failing check decides):
 
@@ -67,6 +70,9 @@ C_PRE_RESET = "pre_reset_command"
 C_WATCHDOG = "watchdog_timeout"
 C_INTERNAL = "internal_error"
 C_TELEMETRY = "telemetry_failure"
+
+# Kernel attributes whose rebinding raises AttributeError after construction.
+_IMMUTABLE = ("_config", "_operator_key", "_telemetry", "_clock", "_sealed", "config")
 
 
 def _floats(value: Any, name: str, n: Optional[int] = None) -> tuple[float, ...]:
@@ -196,12 +202,25 @@ class SafetyKernel:
         self._sealed = True
 
     def __setattr__(self, name: str, value: Any) -> None:
-        # Limits and operator credentials cannot be rebound after construction.
-        if getattr(self, "_sealed", False) and name in (
-            "_config", "_operator_key", "_telemetry", "_clock", "_sealed",
-        ):
+        # After construction the kernel mutates its own state only via _set.
+        # Rebinding limits or credentials raises; any other outside write
+        # (e.g. clearing _estop_reason) is tampering: it is not applied, it
+        # latches the e-stop and it is logged.
+        if not getattr(self, "_sealed", False):
+            object.__setattr__(self, name, value)
+        elif name in _IMMUTABLE:
             raise AttributeError(f"SafetyKernel.{name} is immutable after construction")
+        else:
+            self._tamper(name)
+
+    def _set(self, name: str, value: Any) -> None:
         object.__setattr__(self, name, value)
+
+    def _tamper(self, name: str) -> None:
+        reason = f"tamper: outside write to SafetyKernel.{name}"
+        if self._estop_reason is None:
+            self._set("_estop_reason", reason)
+        self._log_event(self._now(None), decision="tamper", reason=reason, level="error")
 
     def __delattr__(self, name: str) -> None:
         raise AttributeError(f"SafetyKernel attributes cannot be deleted ({name})")
@@ -245,7 +264,7 @@ class SafetyKernel:
                 "reject", "unknown", (), (C_INTERNAL,), f"internal error: {exc!r}", now
             )
         if result.decision.verdict == "approve":
-            self._last_valid_time = now
+            self._set("_last_valid_time", now)
         return self._emit(result, t0)
 
     def tick(self, now: Optional[float] = None) -> Optional[KernelResult]:
@@ -274,7 +293,7 @@ class SafetyKernel:
         t0 = time.perf_counter()
         now = self._now(now)
         if self._estop_reason is None:
-            self._estop_reason = str(reason) or "unspecified"
+            self._set("_estop_reason", str(reason) or "unspecified")
         return self._emit(self._estop_result("estop", now), t0)
 
     def reset_emergency_stop(self, operator_key: str, now: Optional[float] = None) -> None:
@@ -295,9 +314,9 @@ class SafetyKernel:
         )
         if not ok:
             raise PermissionError("invalid operator key; e-stop remains latched")
-        self._estop_reason = None
-        self._last_reset_time = now
-        self._last_valid_time = now
+        self._set("_estop_reason", None)
+        self._set("_last_reset_time", now)
+        self._set("_last_valid_time", now)
 
     # -- internals -----------------------------------------------------------
 
@@ -308,7 +327,7 @@ class SafetyKernel:
         cfg = self._config
         env, pid, problem = self._parse(command)
         if env is not None:
-            self._last_cycle_id = env.cycle_id
+            self._set("_last_cycle_id", env.cycle_id)
         mid = None if env is None else env.message_id
 
         if self.estopped:
@@ -448,7 +467,7 @@ class SafetyKernel:
         if ok:
             return result
         if self._estop_reason is None:
-            self._estop_reason = C_TELEMETRY
+            self._set("_estop_reason", C_TELEMETRY)
         return self._estop_result(d.proposal_id, result.timestamp, result.message_id)
 
     def _log_event(
@@ -475,5 +494,5 @@ class SafetyKernel:
             )
             return True
         except (TelemetryError, ContractError, OSError, ValueError):
-            self._telemetry_failures += 1
+            self._set("_telemetry_failures", self._telemetry_failures + 1)
             return False
