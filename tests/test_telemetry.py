@@ -141,6 +141,19 @@ def test_size_cap_counts_existing_file(tmp_path):
     assert path.stat().st_size == existing
 
 
+def test_size_cap_counts_bytes_appended_by_other_writers(tmp_path):
+    path = tmp_path / "t.jsonl"
+    probe = TelemetryRecord(1000.0, "s1", "info", 0, "e0", "wm-0.1", "accept", "r0", 1.0)
+    line = (probe.to_json() + "\n").encode("utf-8")
+    with TelemetryLog(path, max_bytes=2 * len(line) - 1) as tl:
+        with open(path, "ab") as other:  # a second writer appends after open
+            other.write(line)
+        assert tl.size_bytes == len(line)
+        with pytest.raises(TelemetryCapExceeded):
+            tl.write(probe)
+    assert path.read_bytes() == line
+
+
 @pytest.mark.parametrize("bad", [0, -1, 1.5, True])
 def test_invalid_cap_rejected(tmp_path, bad):
     with pytest.raises(ValueError):

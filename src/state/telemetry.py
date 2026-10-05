@@ -9,7 +9,8 @@ Guarantees:
 
 * append-only: the file is opened in append mode and never rewritten; records
   already present (e.g. from an earlier session) are kept and count towards
-  the size cap;
+  the size cap, as do bytes appended by other writers after this log was
+  opened (the file size is re-read from the OS before every write);
 * each record is validated before anything is written, so an invalid record
   never reaches the file (``ContractError`` from :mod:`contracts`);
 * a configurable byte cap: a write that would make the file exceed
@@ -190,6 +191,8 @@ class TelemetryLog:
 
     @property
     def size_bytes(self) -> int:
+        if not self._closed:
+            self._size = self._current_size()
         return self._size
 
     def write(self, record: TelemetryRecord) -> TelemetryRecord:
@@ -199,6 +202,9 @@ class TelemetryLog:
         if not isinstance(record, TelemetryRecord):
             raise ContractError(f"expected TelemetryRecord, got {type(record).__name__}")
         line = (record.to_json() + "\n").encode("utf-8")
+        # Re-read the real file size: other writers may have appended since
+        # open, and a cached counter would let this instance bypass the cap.
+        self._size = self._current_size()
         if self._size + len(line) > self.max_bytes:
             raise TelemetryCapExceeded(
                 f"writing {len(line)} bytes would exceed cap {self.max_bytes} "
@@ -206,8 +212,13 @@ class TelemetryLog:
             )
         self._fh.write(line)
         self._fh.flush()
-        self._size += len(line)
+        self._size = self._current_size()
         return record
+
+    def _current_size(self) -> int:
+        """Size of the file behind the open handle, as seen by the OS."""
+        self._fh.flush()
+        return os.fstat(self._fh.fileno()).st_size
 
     def log(
         self,
