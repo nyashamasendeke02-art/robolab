@@ -109,6 +109,23 @@ def test_evaluation_set_tasks_are_valid():
         assert len({m.step for m in t.mass_changes}) == len(t.mass_changes)
 
 
+def test_evaluation_set_is_immutable_after_construction():
+    es = _rich_set()
+    fingerprint, text = es.fingerprint(), es.to_json()
+    es.params["n_tasks"] = 99
+    es.params.clear()
+    es.to_dict()["params"]["n_tasks"] = 99
+    source = {"n_tasks": 1, "arena_low": [-1.0, -1.0]}
+    built = EvaluationSet(name="x", seed=0, params=source, tasks=())
+    before = built.fingerprint()
+    source["n_tasks"] = 2
+    source["arena_low"].append(0.0)
+    assert built.fingerprint() == before
+    assert es.fingerprint() == fingerprint and es.to_json() == text
+    with pytest.raises(AttributeError):
+        es.params = {}  # type: ignore[misc]
+
+
 def test_evaluation_set_rejects_unknown_keys():
     raw = json.loads(_rich_set().to_json())
     raw["tasks"][0]["extra"] = 1

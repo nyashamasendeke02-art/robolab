@@ -97,27 +97,49 @@ class TaskInstance:
         return cls(**raw)
 
 
-@dataclass(frozen=True)
+_EVALSET_KEYS = ("name", "seed", "params", "tasks", "version")
+
+
+@dataclass(frozen=True, init=False)
 class EvaluationSet:
-    """Ordered, immutable list of tasks plus the parameters that generated it."""
+    """Ordered, immutable list of tasks plus the parameters that generated it.
+
+    The generation parameters are frozen at construction as canonical JSON;
+    :attr:`params` returns a fresh copy, so mutating it cannot change the set
+    or its :meth:`fingerprint`.
+    """
 
     name: str
     seed: int
-    params: Mapping[str, Any]
+    _params_json: str
     tasks: tuple[TaskInstance, ...]
-    version: str = EVALSET_VERSION
+    version: str
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name:
+    def __init__(self, name: str, seed: int, params: Mapping[str, Any],
+                 tasks: Any, version: str = EVALSET_VERSION) -> None:
+        if not isinstance(name, str) or not name:
             raise ValueError("name must be a non-empty str")
-        # JSON-native params (tuples -> lists) so a JSON round trip is the identity.
-        object.__setattr__(self, "params", json.loads(json.dumps(dict(self.params), allow_nan=False)))
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError(f"seed must be a non-negative int, got {seed!r}")
+        if not isinstance(params, Mapping):
+            raise ValueError(f"params must be a mapping, got {type(params).__name__}")
+        # JSON-native canonical snapshot (tuples -> lists) so a JSON round trip is the identity.
+        params_json = json.dumps(dict(params), allow_nan=False, sort_keys=True)
         tasks = tuple(t if isinstance(t, TaskInstance) else TaskInstance.from_dict(t)
-                      for t in self.tasks)
+                      for t in tasks)
         ids = [t.task_id for t in tasks]
         if len(set(ids)) != len(ids):
             raise ValueError("task_id values must be unique")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "_params_json", params_json)
         object.__setattr__(self, "tasks", tasks)
+        object.__setattr__(self, "version", version)
+
+    @property
+    def params(self) -> dict[str, Any]:
+        """A fresh copy of the generation parameters (mutating it does not affect the set)."""
+        return json.loads(self._params_json)
 
     def __len__(self) -> int:
         return len(self.tasks)
@@ -129,7 +151,7 @@ class EvaluationSet:
         return {
             "name": self.name,
             "seed": self.seed,
-            "params": dict(self.params),
+            "params": self.params,
             "tasks": [t.to_dict() for t in self.tasks],
             "version": self.version,
         }
@@ -139,7 +161,12 @@ class EvaluationSet:
 
     @classmethod
     def from_dict(cls, raw: Any) -> "EvaluationSet":
-        _strict_keys(raw, cls, "EvaluationSet")
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"EvaluationSet: expected object, got {type(raw).__name__}")
+        missing = sorted(set(_EVALSET_KEYS) - set(raw))
+        unknown = sorted(set(raw) - set(_EVALSET_KEYS))
+        if missing or unknown:
+            raise ValueError(f"EvaluationSet: missing {missing}, unknown {unknown}")
         if raw["version"] != EVALSET_VERSION:
             raise ValueError(f"evaluation set version {raw['version']!r} != {EVALSET_VERSION!r}")
         return cls(**raw)
