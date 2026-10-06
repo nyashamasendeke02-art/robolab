@@ -1,4 +1,4 @@
-"""Deterministic Safety Kernel v1.1 (Gate 0/1, REQ-SAFE, ADR-003; ENG-0004, ENG-0010).
+"""Deterministic Safety Kernel v1.2 (Gate 0/1, REQ-SAFE, REQ-SAFE+, ADR-003; ENG-0004, ENG-0010, ENG-0012).
 
 Every actuator command passes :meth:`SafetyKernel.check`. The kernel is the
 final authority of the control cycle and sits outside learned authority: its
@@ -76,6 +76,36 @@ Watchdog: :meth:`SafetyKernel.tick` must be called periodically; when no
 command has been approved for longer than ``watchdog_timeout_s`` it returns a
 decision whose ``actuator_command`` is the safe action (and ``None`` otherwise,
 meaning the last approved command may stand).
+
+v1.2 (ENG-0012, G1-5, APR-0003):
+
+* :meth:`SafetyConfig.from_mhs` / :meth:`SafetyKernel.from_mhs` configure the
+  kernel from a Model Hardware Standard description (``contracts.MHS``) with
+  no per-body code. Kernel model requirements (one ``force`` actuator per
+  workspace axis, in workspace-axis order, braking by ``actuators``, latching
+  operator-reset e-stop that brakes) are checked; an MHS the kernel cannot
+  model raises ``ContractError``.
+* Safety independence: :meth:`SafetyKernel.observed_kinematics` reads position
+  and velocity from the raw ``Observation`` through the configured channels
+  (``position_channels`` / ``velocity_channels``, from the MHS sensor layout;
+  default ``pos_<axis>`` / ``vel_<axis>``), so a state estimator cannot change
+  what the kernel checks against. Missing channels read as NaN (``invalid_state``).
+* Mass interval: ``mass_kg`` is an upper and ``mass_lower_kg`` (default
+  ``mass_kg``) a lower bound on the true mass. The command step is predicted
+  at both bounds (either may be the worse case); the braking deceleration
+  uses the upper bound (and is capped by ``brake_decel`` when given); the
+  braking safe action's last-step reduction uses the lower bound,
+  ``-mass_lower_kg * v / dt``, so a lighter body is never reversed. With a
+  lighter true body that last step leaves a residual speed that decays
+  geometrically (ratio at most ``1 - mass_lower_kg / mass_kg``); the stopping
+  distance includes that tail. With ``mass_lower_kg == mass_kg`` every check
+  is exactly the v1.1 computation.
+* ``max_speed`` (optional, per axis): the predicted speed after the command
+  must not exceed it (constraint ``speed[axis]``; handled like ``stopping``).
+* :meth:`SafetyKernel.no_command`: the decision for a cycle with no command
+  to check (abstain, module failure): ``reject`` with constraint
+  ``no_command`` and the braking safe action (or the e-stop decision). It does
+  not reset the watchdog.
 """
 
 from __future__ import annotations
@@ -86,10 +116,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
-from contracts import ActionProposal, ContractError, Envelope, SafetyDecision
+from contracts import MHS, ActionProposal, ContractError, Envelope, Observation, SafetyDecision
 from state.telemetry import TelemetryError, TelemetryLog
 
-KERNEL_VERSION = "safety-kernel-1.1.0"
+KERNEL_VERSION = "safety-kernel-1.2.0"
 LIMIT_MODES = ("clamp", "reject")
 COMPONENT = "safety"
 
@@ -101,6 +131,7 @@ C_STALE = "stale_command"
 C_FUTURE = "future_command"
 C_PRE_RESET = "pre_reset_command"
 C_WATCHDOG = "watchdog_timeout"
+C_NO_COMMAND = "no_command"
 C_INTERNAL = "internal_error"
 C_TELEMETRY = "telemetry_failure"
 
@@ -135,20 +166,34 @@ def _positive(value: Any, name: str) -> float:
     return value
 
 
-def _stopping_distances(speed: float, a_brake: float, dt: float) -> tuple[float, float]:
+def _stopping_distances(
+    speed: float, a_brake: float, dt: float, q: float = 0.0
+) -> tuple[float, float]:
     """Distances (zero-order hold, semi-implicit Euler) covered while braking from
-    ``speed`` with deceleration ``min(a_brake, speed_k / dt)`` per control period."""
+    ``speed`` with deceleration ``min(a_brake, speed_k / dt)`` per control period.
+
+    ``q = 1 - mass_lower / mass_upper`` (v1.2): the reduced last-step action
+    computed with the lower mass bound removes only a fraction ``>= 1 - q`` of
+    the remaining speed from a heavier body. The speeds are then bounded by
+    ``w_{k+1} = max(w_k - a_brake*dt, q*w_k)``; the distances below are those of
+    that bound (for ``q == 0`` exactly the v1.1 formulas)."""
     if speed <= 0.0:
         return 0.0, 0.0
     if a_brake <= 0.0:
         return math.inf, math.inf
     step = a_brake * dt  # speed removed by one full braking period
-    n = math.floor(speed / step)  # full braking periods
-    rest = speed - n * step  # speed removed by the final, reduced period
     continuous = speed * speed / (2.0 * a_brake)
-    zoh = max(continuous, continuous - rest * rest / (2.0 * a_brake) + 0.5 * rest * dt)
-    semi_implicit = dt * (n * speed - step * n * (n + 1) / 2.0)
-    return zoh, max(0.0, semi_implicit)
+    if q <= 0.0:
+        n = math.floor(speed / step)  # full braking periods
+        rest = speed - n * step  # speed removed by the final, reduced period
+        zoh = max(continuous, continuous - rest * rest / (2.0 * a_brake) + 0.5 * rest * dt)
+        semi_implicit = dt * (n * speed - step * n * (n + 1) / 2.0)
+        return zoh, max(0.0, semi_implicit)
+    w_star = step / (1.0 - q)  # below this the bound decays geometrically
+    n = max(0, math.ceil((speed - w_star) / step))  # linear braking periods
+    w_n = speed - n * step
+    total = n * speed - step * n * (n + 1) / 2.0 + w_n * q / (1.0 - q)  # sum_{k>=1} w_k
+    return max(continuous, dt * (0.5 * speed + total)), max(0.0, dt * total)
 
 
 @dataclass(frozen=True)
@@ -167,6 +212,11 @@ class SafetyConfig:
     control_dt_s: float = 0.01
     safe_action: Optional[tuple[float, ...]] = None  # default: zero force
     kernel_version: str = KERNEL_VERSION
+    mass_lower_kg: Optional[float] = None  # lower mass bound; default: mass_kg
+    max_speed: Optional[tuple[float, ...]] = None  # m/s per axis; None: no speed check
+    brake_decel: Optional[tuple[float, ...]] = None  # m/s^2 per axis cap; None: actuators
+    position_channels: Optional[tuple[str, ...]] = None  # default: pos_<axis>
+    velocity_channels: Optional[tuple[str, ...]] = None  # default: vel_<axis>
 
     def __post_init__(self) -> None:
         names = tuple(self.axis_names)
@@ -175,7 +225,21 @@ class SafetyConfig:
         if len(set(names)) != len(names):
             raise ValueError(f"axis_names must be unique, got {names}")
         n = len(names)
+        mass = _positive(self.mass_kg, "mass_kg")
         fixed = {
+            "mass_lower_kg": (
+                mass if self.mass_lower_kg is None
+                else _positive(self.mass_lower_kg, "mass_lower_kg")
+            ),
+            "max_speed": (
+                None if self.max_speed is None else _floats(self.max_speed, "max_speed", n)
+            ),
+            "brake_decel": (
+                None if self.brake_decel is None
+                else _floats(self.brake_decel, "brake_decel", n)
+            ),
+            "position_channels": _channels(self.position_channels, "pos", names),
+            "velocity_channels": _channels(self.velocity_channels, "vel", names),
             "axis_names": names,
             "action_low": _floats(self.action_low, "action_low", n),
             "action_high": _floats(self.action_high, "action_high", n),
@@ -183,7 +247,7 @@ class SafetyConfig:
             "workspace_high": _floats(self.workspace_high, "workspace_high", n),
             "max_command_age_s": _positive(self.max_command_age_s, "max_command_age_s"),
             "watchdog_timeout_s": _positive(self.watchdog_timeout_s, "watchdog_timeout_s"),
-            "mass_kg": _positive(self.mass_kg, "mass_kg"),
+            "mass_kg": mass,
             "control_dt_s": _positive(self.control_dt_s, "control_dt_s"),
             "safe_action": (
                 (0.0,) * n
@@ -204,10 +268,79 @@ class SafetyConfig:
                 raise ValueError(f"workspace_low >= workspace_high on axis {a}")
             if not self.action_low[i] <= self.safe_action[i] <= self.action_high[i]:
                 raise ValueError(f"safe_action outside action limits on axis {a}")
+        if self.mass_lower_kg > self.mass_kg:
+            raise ValueError("mass_lower_kg must be <= mass_kg")
+        if self.max_speed is not None and not all(s > 0 for s in self.max_speed):
+            raise ValueError("max_speed must be > 0")
+        if self.brake_decel is not None and not all(b >= 0 for b in self.brake_decel):
+            raise ValueError("brake_decel must be >= 0")
+        channels = self.position_channels + self.velocity_channels
+        if len(set(channels)) != len(channels):
+            raise ValueError(f"position/velocity channels must be unique, got {channels}")
 
     @property
     def n_axes(self) -> int:
         return len(self.axis_names)
+
+    @classmethod
+    def from_mhs(
+        cls, mhs: MHS, *, limit_mode: str = "reject", kernel_version: str = KERNEL_VERSION
+    ) -> "SafetyConfig":
+        """Kernel limits from a Model Hardware Standard description (no per-body code).
+
+        Raises ``ContractError`` for an invalid MHS or one the kernel's model
+        does not cover (see the module docstring). ``limit_mode`` is kernel
+        policy, not a body property, so it is passed separately.
+        """
+        if not isinstance(mhs, MHS):
+            raise TypeError(f"mhs must be MHS, got {type(mhs).__name__}")
+        mhs.validate()
+        env = mhs.safety
+        axes = env.workspace_axes
+        acts = mhs.action_actuators
+        if len(acts) != len(axes) or any(
+            a.kind != "force" or a.axis != axis or a.frame != env.workspace_frame
+            for a, axis in zip(acts, axes)
+        ):
+            raise ContractError(
+                f"{KERNEL_VERSION} models one force actuator per workspace axis "
+                f"{list(axes)} (frame {env.workspace_frame!r}), in workspace-axis order; "
+                f"action layout {list(mhs.action_layout)} does not match"
+            )
+        if env.braking != "actuators":
+            raise ContractError(f"{KERNEL_VERSION} needs braking='actuators', got {env.braking!r}")
+        if not (env.estop_latching and env.estop_reset == "operator" and env.estop_action == "brake"):
+            raise ContractError(
+                f"{KERNEL_VERSION} implements a latching, operator-reset e-stop that brakes"
+            )
+        return cls(
+            axis_names=axes,
+            action_low=tuple(a.low for a in acts),
+            action_high=tuple(a.high for a in acts),
+            workspace_low=env.workspace_low,
+            workspace_high=env.workspace_high,
+            max_command_age_s=mhs.control.max_command_age_s,
+            watchdog_timeout_s=mhs.control.watchdog_timeout_s,
+            limit_mode=limit_mode,
+            mass_kg=env.mass_kg,
+            control_dt_s=mhs.control.period_s,
+            safe_action=env.safe_action,
+            kernel_version=kernel_version,
+            mass_lower_kg=env.mass_lower_bound_kg,
+            max_speed=env.speed_limits,
+            brake_decel=env.brake_decel_mps2,
+            position_channels=tuple(mhs.channel("position", a) for a in axes),
+            velocity_channels=tuple(mhs.channel("velocity", a) for a in axes),
+        )
+
+
+def _channels(value: Any, prefix: str, axes: tuple[str, ...]) -> tuple[str, ...]:
+    if value is None:
+        return tuple(f"{prefix}_{a}" for a in axes)
+    out = tuple(value)
+    if len(out) != len(axes) or not all(isinstance(c, str) and c for c in out):
+        raise ValueError(f"{prefix} channels: expected {len(axes)} non-empty strings, got {out}")
+    return out
 
 
 @dataclass(frozen=True)
@@ -253,6 +386,19 @@ class SafetyKernel:
         self._telemetry_failures = 0
         self._sealed = True
 
+    @classmethod
+    def from_mhs(
+        cls,
+        mhs: MHS,
+        telemetry: TelemetryLog,
+        operator_key: str,
+        clock: Callable[[], float] = time.time,
+        *,
+        limit_mode: str = "reject",
+    ) -> "SafetyKernel":
+        """A kernel configured from ``mhs`` (:meth:`SafetyConfig.from_mhs`)."""
+        return cls(SafetyConfig.from_mhs(mhs, limit_mode=limit_mode), telemetry, operator_key, clock)
+
     def __setattr__(self, name: str, value: Any) -> None:
         # After construction the kernel mutates its own state only via _set.
         # Rebinding limits or credentials raises; any other outside write
@@ -292,6 +438,28 @@ class SafetyKernel:
         return self._telemetry_failures
 
     # -- command path --------------------------------------------------------
+
+    def observed_kinematics(
+        self, observation: Any
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """(position, velocity) read from a raw :class:`Observation` through the
+        configured channels. Never raises: a missing channel, duplicated channel
+        names or an invalid observation read as NaN, which :meth:`check` rejects
+        as ``invalid_state`` and :meth:`tick` treats as an unknown velocity."""
+        cfg = self._config
+        nan = (math.nan,) * cfg.n_axes
+        try:
+            if type(observation) is not Observation:
+                return nan, nan
+            observation.validate()
+            if len(set(observation.channels)) != len(observation.channels):
+                return nan, nan
+            values = dict(zip(observation.channels, observation.values))
+            pos = tuple(values.get(c, math.nan) for c in cfg.position_channels)
+            vel = tuple(values.get(c, math.nan) for c in cfg.velocity_channels)
+            return pos, vel
+        except Exception:
+            return nan, nan
 
     def check(
         self,
@@ -347,6 +515,29 @@ class SafetyKernel:
                 t0, safe,
             )
         return None
+
+    def no_command(
+        self,
+        now: Optional[float] = None,
+        *,
+        velocity: Optional[Sequence[float]] = None,
+        reason: str = "no command to check this cycle",
+    ) -> KernelResult:
+        """Decision for a cycle without a command (abstain, module failure).
+
+        ``reject`` with constraint ``no_command`` (or the e-stop decision when
+        latched) whose ``actuator_command`` is the safe action, braking when
+        ``velocity`` is known. Does not reset the watchdog.
+        """
+        t0 = time.perf_counter()
+        now = self._now(now)
+        safe = self._safe_action(velocity)
+        if self.estopped:
+            return self._emit(self._estop_result(C_NO_COMMAND, now, safe=safe), t0, safe)
+        return self._emit(
+            self._result("reject", C_NO_COMMAND, (), (C_NO_COMMAND,), str(reason), now, safe=safe),
+            t0, safe,
+        )
 
     # -- emergency stop (independent of every learned module) -----------------
 
@@ -470,11 +661,13 @@ class SafetyKernel:
                     return res(
                         "approve", pid, safe, constraints,
                         "replaced by braking action: body could not stop inside the "
-                        f"workspace on {len(cannot_stop)} axis/axes", now, mid,
+                        f"workspace (or exceeded a speed limit) on {len(cannot_stop)} "
+                        "axis/axes", now, mid,
                     )
             return res(
                 "reject", pid, (), constraints,
-                "body could not stop inside the workspace after this command", now, mid,
+                "body could not stop inside the workspace (or exceeded a speed limit) "
+                "after this command", now, mid,
             )
 
         reason = (
@@ -488,31 +681,58 @@ class SafetyKernel:
         """Return (axes whose next position leaves the workspace, axes that could
         not stop inside the workspace afterwards) for ``applied`` from (pos, vel)."""
         cfg = self._config
-        dt, m = cfg.control_dt_s, cfg.mass_kg
+        m_hi, m_lo = cfg.mass_kg, cfg.mass_lower_kg
+        # The command step is predicted at both mass bounds (equal bounds: once,
+        # exactly as in v1.1).
+        masses = (m_hi,) if m_lo == m_hi else (m_lo, m_hi)
+        q = 1.0 - m_lo / m_hi
         outside, cannot_stop = [], []
         for i, a in enumerate(cfg.axis_names):
-            lo, hi = cfg.workspace_low[i], cfg.workspace_high[i]
-            acc = applied[i] / m
-            p = pos[i] + vel[i] * dt + 0.5 * acc * dt * dt
-            if not lo <= p <= hi:
+            found: set[str] = set()
+            for m in masses:
+                found |= self._axis_check(i, pos[i], vel[i], applied[i], m, q)
+            if "outside" in found:
                 outside.append(f"workspace[{a}]")
                 continue
-            v = vel[i] + acc * dt
-            if v == 0.0:
-                continue
-            if v > 0:
-                bound, sign, a_brake = hi, 1.0, max(0.0, -cfg.action_low[i]) / m
-            else:
-                bound, sign, a_brake = lo, -1.0, max(0.0, cfg.action_high[i]) / m
-            d_zoh, d_si = _stopping_distances(abs(v), a_brake, dt)
-            p_si = pos[i] + v * dt  # semi-implicit Euler next position
-            slack = _TOL * max(1.0, abs(bound))
-            if not (
-                sign * (p + sign * d_zoh - bound) <= slack
-                and sign * (p_si + sign * d_si - bound) <= slack
-            ):
+            if "speed" in found:
+                cannot_stop.append(f"speed[{a}]")
+            if "stop" in found:
                 cannot_stop.append(f"stopping[{a}]")
         return outside, cannot_stop
+
+    def _axis_check(
+        self, i: int, p0: float, v0: float, u: float, m: float, q: float
+    ) -> set[str]:
+        """Failed checks ("outside", "speed", "stop") on axis ``i`` for force ``u``
+        applied to mass ``m``; braking always uses the upper mass bound."""
+        cfg = self._config
+        dt = cfg.control_dt_s
+        lo, hi = cfg.workspace_low[i], cfg.workspace_high[i]
+        acc = u / m
+        p = p0 + v0 * dt + 0.5 * acc * dt * dt
+        if not lo <= p <= hi:
+            return {"outside"}
+        v = v0 + acc * dt
+        found = set()
+        if cfg.max_speed is not None and abs(v) > cfg.max_speed[i]:
+            found.add("speed")
+        if v == 0.0:
+            return found
+        if v > 0:
+            bound, sign, a_brake = hi, 1.0, max(0.0, -cfg.action_low[i]) / cfg.mass_kg
+        else:
+            bound, sign, a_brake = lo, -1.0, max(0.0, cfg.action_high[i]) / cfg.mass_kg
+        if cfg.brake_decel is not None:
+            a_brake = min(a_brake, cfg.brake_decel[i])
+        d_zoh, d_si = _stopping_distances(abs(v), a_brake, dt, q)
+        p_si = p0 + v * dt  # semi-implicit Euler next position
+        slack = _TOL * max(1.0, abs(bound))
+        if not (
+            sign * (p + sign * d_zoh - bound) <= slack
+            and sign * (p_si + sign * d_si - bound) <= slack
+        ):
+            found.add("stop")
+        return found
 
     def _safe_action(self, velocity: Any) -> tuple[float, ...]:
         """Braking safe action for ``velocity``; configured safe_action if unknown."""
@@ -528,7 +748,8 @@ class SafetyKernel:
             if v == 0.0:
                 out.append(cfg.safe_action[i])
             else:
-                u = -cfg.mass_kg * v / cfg.control_dt_s
+                # Lower mass bound: the last, reduced step never reverses the body.
+                u = -cfg.mass_lower_kg * v / cfg.control_dt_s
                 out.append(min(max(u, cfg.action_low[i]), cfg.action_high[i]))
         return tuple(out)
 

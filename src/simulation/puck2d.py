@@ -50,6 +50,14 @@ performs one :meth:`step` with the kernel-approved command and returns an
 own seeded Generator keeps a simulated trajectory independent of how many
 draws other modules make. :attr:`Puck2D.time` (``steps * dt``) can serve as
 the runner clock offset.
+
+Model Hardware Standard (G1-5, REQ-MHS; ENG-0012): :meth:`Puck2D.mhs` publishes
+the body's :class:`contracts.MHS` - a ``point_mass`` with force actuators
+``force_x`` / ``force_y`` (action layout in that order), scalar sensors
+``pos_x``, ``pos_y``, ``vel_x``, ``vel_y`` (observation layout =
+:data:`CHANNELS`), control period ``dt`` and a safety envelope whose mass
+bounds contain every mass the body will have. ``Body.mass_kg`` is declared
+unknown: the true (possibly changing) mass is ground truth (G1-4).
 """
 
 from __future__ import annotations
@@ -61,10 +69,23 @@ from typing import Any, Mapping, Optional, Union
 
 import numpy as np
 
-from contracts import Observation, Outcome, Uncertainty
+from contracts import (
+    MHS,
+    Actuator,
+    Body,
+    Control,
+    Footprint,
+    NoiseModel,
+    Observation,
+    Outcome,
+    SafetyEnvelope,
+    Sensor,
+    Uncertainty,
+)
 
 PUCK2D_VERSION = "puck2d-0.1.0"
 CHANNELS = ("pos_x", "pos_y", "vel_x", "vel_y")
+AXES = ("x", "y")
 
 
 class EpisodeOver(RuntimeError):
@@ -384,6 +405,88 @@ class Puck2D:
         under a ``ground_truth`` key and never passes it to a brain module.
         """
         return copy.deepcopy(self._last_info)
+
+    # -- Model Hardware Standard ---------------------------------------------------
+
+    def mhs(
+        self,
+        *,
+        workspace_low: tuple[float, float] = (-2.0, -2.0),
+        workspace_high: tuple[float, float] = (2.0, 2.0),
+        max_command_age_s: float = 0.05,
+        watchdog_timeout_s: float = 0.1,
+        mass_bounds: Optional[tuple[float, float]] = None,
+    ) -> MHS:
+        """This body's MHS. The workspace and command timing are deployment
+        settings, hence parameters. ``mass_bounds`` (low, high) must contain the
+        configured mass and every scheduled mass change (default: exactly their
+        min and max); a fleet-level bound avoids revealing a task's schedule."""
+        cfg = self.config
+        masses = [cfg.mass, *(mc.mass for mc in cfg.mass_changes)]
+        lo_m, hi_m = (min(masses), max(masses)) if mass_bounds is None else (
+            _num(mass_bounds[0], "mass_bounds[0]", low=0.0, strict=True),
+            _num(mass_bounds[1], "mass_bounds[1]", low=0.0, strict=True),
+        )
+        if not lo_m <= min(masses) <= max(masses) <= hi_m:
+            raise ValueError(f"mass_bounds {(lo_m, hi_m)} do not contain the masses {masses}")
+        rate = 1.0 / cfg.dt
+
+        def noise(std: float) -> NoiseModel:
+            return NoiseModel("gaussian", std) if std > 0 else NoiseModel("none", None)
+
+        sensors = tuple(
+            Sensor(f"{q}_{a}", kind, units, (), rate, noise(std), "world", a)
+            for q, kind, units, std in (
+                ("pos", "position", "m", cfg.pos_noise_std),
+                ("vel", "velocity", "m/s", cfg.vel_noise_std),
+            )
+            for a in AXES
+        )
+        actuators = tuple(
+            Actuator(f"force_{a}", "force", "N", a, "world", cfg.force_low[i], cfg.force_high[i],
+                     None, cfg.actuator_tau)
+            for i, a in enumerate(AXES)
+        )
+        return MHS(
+            body_name="puck2d",
+            body_class="point_mass",
+            actuators=actuators,
+            action_layout=tuple(a.name for a in actuators),
+            sensors=sensors,
+            observation_layout=CHANNELS,
+            body=Body(
+                mass_kg=None,
+                inertia_kgm2=None,
+                footprint=(
+                    Footprint("circle", (cfg.puck_radius,)) if cfg.puck_radius > 0
+                    else Footprint("point", ())
+                ),
+                frames=("world", "base"),
+                base_frame="base",
+            ),
+            control=Control(
+                period_s=cfg.dt,
+                max_command_age_s=float(max_command_age_s),
+                watchdog_timeout_s=float(watchdog_timeout_s),
+                max_cycle_latency_s=cfg.dt,
+                reflexes=("force_saturation",),
+            ),
+            safety=SafetyEnvelope(
+                workspace_frame="world",
+                workspace_axes=AXES,
+                workspace_low=tuple(float(v) for v in workspace_low),
+                workspace_high=tuple(float(v) for v in workspace_high),
+                speed_limits=None,
+                mass_kg=hi_m,
+                mass_lower_bound_kg=None if lo_m == hi_m else lo_m,
+                braking="actuators",
+                brake_decel_mps2=None,
+                safe_action=(0.0, 0.0),
+                estop_latching=True,
+                estop_reset="operator",
+                estop_action="brake",
+            ),
+        )
 
     # -- robot.runner.Environment ------------------------------------------------
 

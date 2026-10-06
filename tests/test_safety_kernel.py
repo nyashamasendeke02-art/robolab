@@ -367,9 +367,12 @@ def test_outside_state_write_latches_estop_and_is_logged(tl, name, value):
 def test_no_public_mutator_api(tl):
     k = _kernel(tl)
     public = {n for n in dir(k) if not n.startswith("_")}
+    # v1.2 (ENG-0012) adds no mutator: from_mhs is a constructor, observed_kinematics
+    # is a pure read and no_command only emits a (logged) safe-action decision.
     assert public == {
         "check", "tick", "emergency_stop", "reset_emergency_stop",
         "config", "estopped", "telemetry_failures",
+        "from_mhs", "observed_kinematics", "no_command",
     }
 
 
