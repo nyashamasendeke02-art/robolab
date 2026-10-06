@@ -57,6 +57,22 @@ def test_eval_set_json_round_trip_unchanged(tmp_path):
         assert json.loads(path.read_text(encoding="utf-8")) == es.to_dict()
 
 
+def test_eval_set_env_params_are_read_only():
+    params = {"friction": 0.05, "max_steps": 20, "force_high": [5.0, 5.0]}
+    es = build_eval_set(17, PLAIN, env_params=params)
+    params["friction"] = 0.9  # the caller's dict is copied, not aliased
+    assert es.env_params["friction"] == 0.05
+    with pytest.raises(TypeError):
+        es.env_params["friction"] = 0.5
+    with pytest.raises(TypeError):
+        es.env_params["force_high"][0] = 1.0
+    loaded = EvalSet.from_json(es.to_json())
+    with pytest.raises(TypeError):
+        loaded.env_params["max_steps"] = 1
+    assert loaded == es
+    assert es.tasks[0].env_config(es.env_params).force_high == (5.0, 5.0)
+
+
 def test_rich_eval_set_contains_every_disturbance_kind():
     es = build_eval_set(5, RICH)
     assert any(t.obstacles for t in es.tasks)

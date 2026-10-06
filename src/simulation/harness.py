@@ -54,6 +54,7 @@ import json
 import math
 import os
 from dataclasses import asdict, dataclass, fields, replace
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional, Sequence, Union
 
 import numpy as np
@@ -82,7 +83,25 @@ TASK_FIELDS = ("start_pos", "goal", "obstacles", "impulses", "mass_changes", "fr
 
 def _json_normal(value: Any) -> Any:
     """The value as it reads back from JSON (tuples become lists)."""
-    return json.loads(json.dumps(value, allow_nan=False, sort_keys=True))
+    return json.loads(json.dumps(_thaw(value), allow_nan=False, sort_keys=True))
+
+
+def _freeze(value: Any) -> Any:
+    """A read-only deep copy: mappings become MappingProxyType, lists become tuples."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _freeze(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    """Inverse of ``_freeze``: plain dicts and lists (for JSON and config parsing)."""
+    if isinstance(value, Mapping):
+        return {k: _thaw(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw(v) for v in value]
+    return value
 
 
 def _check_keys(raw: Any, cls: type, name: str) -> None:
@@ -128,7 +147,7 @@ class TaskInstance:
 
     def env_config(self, env_params: Optional[Mapping[str, Any]] = None) -> Puck2DConfig:
         """Puck2D config: shared ``env_params`` plus this task's fields."""
-        base = Puck2DConfig.from_mapping(dict(env_params or {}))
+        base = Puck2DConfig.from_mapping(_thaw(env_params or {}))
         return replace(
             base,
             start_pos=self.start,
@@ -223,7 +242,8 @@ class EvalSet:
         if owned:
             raise ValueError(f"EvalSet.env_params must not set task fields {owned}")
         Puck2DConfig.from_mapping(dict(self.env_params))  # validate
-        object.__setattr__(self, "env_params", _json_normal(dict(self.env_params)))
+        # Deep read-only so in-memory physics cannot drift from the saved JSON.
+        object.__setattr__(self, "env_params", _freeze(_json_normal(self.env_params)))
         tasks = tuple(
             t if isinstance(t, TaskInstance) else TaskInstance.from_dict(t) for t in self.tasks
         )
@@ -243,7 +263,7 @@ class EvalSet:
             "seed": self.seed,
             "version": self.version,
             "spec": _json_normal(asdict(self.spec)),
-            "env_params": _json_normal(dict(self.env_params)),
+            "env_params": _json_normal(self.env_params),
             "tasks": [t.to_dict() for t in self.tasks],
         }
 
