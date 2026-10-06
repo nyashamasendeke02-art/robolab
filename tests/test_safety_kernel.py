@@ -127,7 +127,8 @@ def test_predicted_workspace_exit_rejected(tl):
     r = _check(k, _cmd((10.0, 0.0)), pos=(0.95, 0.0), vel=(0.5, 0.0))
     assert r.decision.verdict == "reject"
     assert r.decision.violated_constraints == ("workspace[x]",)
-    assert r.actuator_command == (0.0, 0.0)
+    # v1.1 safe action brakes: clip(-m v / dt) = clip(-1 * 0.5 / 0.1) = -5.
+    assert r.actuator_command == (-5.0, 0.0)
 
 
 def test_workspace_uses_clamped_action(tl):

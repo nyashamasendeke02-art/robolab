@@ -1,4 +1,4 @@
-"""Deterministic Safety Kernel v1 (Gate 0, REQ-SAFE, ADR-003; ENG-0004).
+"""Deterministic Safety Kernel v1.1 (Gate 0/1, REQ-SAFE, ADR-003; ENG-0004, ENG-0010).
 
 Every actuator command passes :meth:`SafetyKernel.check`. The kernel is the
 final authority of the control cycle and sits outside learned authority: its
@@ -21,7 +21,12 @@ Checks, in order (the first failing check decides):
 5. per-axis action limits: ``limit_mode="clamp"`` clamps and approves with the
    violated limits listed in ``violated_constraints``; ``"reject"`` rejects;
 6. workspace: the next position predicted from the action that would actually
-   be applied must stay inside the workspace box, else ``reject``.
+   be applied must stay inside the workspace box, else ``reject``;
+7. stopping distance (v1.1): after the command the body must still be able to
+   stop inside the workspace under the braking safe action (see below), else
+   ``reject`` (constraint ``stopping[axis]``); in ``limit_mode="clamp"`` the
+   command is instead replaced by the braking action and approved, provided
+   the braking action itself passes checks 6 and 7.
 
 The contracts' ``SAFETY_VERDICTS`` has no ``clamp``: a clamped command is
 ``approve`` with the clamped ``approved_action`` and a non-empty
@@ -30,7 +35,16 @@ The contracts' ``SAFETY_VERDICTS`` has no ``clamp``: a clamped command is
 Every call returns a :class:`KernelResult` holding the contract
 :class:`SafetyDecision`, a human-readable ``reason`` and ``actuator_command``,
 the action that may reach the actuators: ``approved_action`` on approve and
-the configured safe action (zero force) otherwise. Every decision is written to
+the safe action otherwise.
+
+Safe action (v1.1): with a known current velocity ``v`` (every :meth:`check`
+with a valid state, and :meth:`tick` / :meth:`emergency_stop` when given
+``velocity``) the safe action brakes: per axis
+``clip(-mass_kg * v / control_dt_s, action_low, action_high)``, i.e. a force
+opposing the velocity at the action limit, reduced on the last step so that it
+stops the body instead of reversing it, and the configured ``safe_action``
+component (default zero force) on an axis at rest. Without a known velocity
+the configured ``safe_action`` is used, as in v1. Every decision is written to
 the telemetry log (component ``"safety"``). If telemetry cannot be written the
 kernel latches the emergency stop, since an unobservable kernel is not safe;
 for the same reason an operator reset that cannot be logged is not applied.
@@ -38,7 +52,25 @@ for the same reason an operator reset that cannot be logged is not applied.
 Workspace prediction model (deterministic, not learned): each action component
 is a force on the matching Cartesian axis of a point mass ``mass_kg``; over one
 control period ``control_dt_s`` the predicted position is
-``p + v*dt + 0.5*(u/m)*dt**2`` per axis.
+``p' = p + v*dt + 0.5*(u/m)*dt**2`` per axis and the velocity ``v' = v + (u/m)*dt``.
+
+Stopping-distance check (v1.1): per axis, braking deceleration
+``a_brake = |action limit opposing v'| / mass_kg`` (friction and damping are
+ignored, which is conservative since both only slow the body). The point where
+the body comes to rest, ``p' + sign(v') * d``, must lie inside the workspace,
+where ``d >= v'**2 / (2*a_brake)`` is the stopping distance in the direction of
+motion. The braking action is applied in discrete control periods, so ``d`` is
+the larger of the exact stopping distances of that braking sequence under the
+kernel's zero-order-hold model above (from ``p'``; never shorter than
+``v'**2 / (2*a_brake)``) and under semi-implicit Euler integration (``v`` is
+updated before ``p``, e.g. Puck2D; there the command step itself ends at
+``p + v'*dt``). Taking the worse of the two keeps the guarantee for either
+plant discretisation. An axis that cannot brake in the direction of motion
+(``a_brake == 0``) fails the check whenever ``v' != 0`` towards a bound.
+Comparisons allow ``_TOL`` relative rounding slack (about 1e-12 of the bound),
+so that exactly-tight stops computed in floating point are not rejected.
+Not modelled: actuator lag, impulses, mass changes, a ``mass_kg`` lower than
+the true mass, or a plant period different from ``control_dt_s``.
 
 Watchdog: :meth:`SafetyKernel.tick` must be called periodically; when no
 command has been approved for longer than ``watchdog_timeout_s`` it returns a
@@ -57,7 +89,7 @@ from typing import Any, Callable, Optional, Sequence
 from contracts import ActionProposal, ContractError, Envelope, SafetyDecision
 from state.telemetry import TelemetryError, TelemetryLog
 
-KERNEL_VERSION = "safety-kernel-1.0.0"
+KERNEL_VERSION = "safety-kernel-1.1.0"
 LIMIT_MODES = ("clamp", "reject")
 COMPONENT = "safety"
 
@@ -71,6 +103,9 @@ C_PRE_RESET = "pre_reset_command"
 C_WATCHDOG = "watchdog_timeout"
 C_INTERNAL = "internal_error"
 C_TELEMETRY = "telemetry_failure"
+
+# Relative floating-point slack for the stopping-distance comparison.
+_TOL = 1e-12
 
 # Kernel attributes whose rebinding raises AttributeError after construction.
 _IMMUTABLE = ("_config", "_operator_key", "_telemetry", "_clock", "_sealed", "config")
@@ -98,6 +133,22 @@ def _positive(value: Any, name: str) -> float:
     if not (math.isfinite(value) and value > 0):
         raise ValueError(f"{name} must be finite and > 0, got {value}")
     return value
+
+
+def _stopping_distances(speed: float, a_brake: float, dt: float) -> tuple[float, float]:
+    """Distances (zero-order hold, semi-implicit Euler) covered while braking from
+    ``speed`` with deceleration ``min(a_brake, speed_k / dt)`` per control period."""
+    if speed <= 0.0:
+        return 0.0, 0.0
+    if a_brake <= 0.0:
+        return math.inf, math.inf
+    step = a_brake * dt  # speed removed by one full braking period
+    n = math.floor(speed / step)  # full braking periods
+    rest = speed - n * step  # speed removed by the final, reduced period
+    continuous = speed * speed / (2.0 * a_brake)
+    zoh = max(continuous, continuous - rest * rest / (2.0 * a_brake) + 0.5 * rest * dt)
+    semi_implicit = dt * (n * speed - step * n * (n + 1) / 2.0)
+    return zoh, max(0.0, semi_implicit)
 
 
 @dataclass(frozen=True)
@@ -258,22 +309,32 @@ class SafetyKernel:
         """
         t0 = time.perf_counter()
         now = self._now(now)
+        safe = self._config.safe_action
         try:
-            result = self._evaluate(command, position, velocity, now)
+            safe = self._safe_action(velocity)
+            result = self._evaluate(command, position, velocity, now, safe)
         except Exception as exc:  # fail safe on any internal fault
             result = self._result(
-                "reject", "unknown", (), (C_INTERNAL,), f"internal error: {exc!r}", now
+                "reject", "unknown", (), (C_INTERNAL,), f"internal error: {exc!r}", now,
+                safe=safe,
             )
         if result.decision.verdict == "approve":
             self._set("_last_valid_time", now)
-        return self._emit(result, t0)
+        return self._emit(result, t0, safe)
 
-    def tick(self, now: Optional[float] = None) -> Optional[KernelResult]:
-        """Watchdog. Returns the safe-action decision on timeout/e-stop, else None."""
+    def tick(
+        self, now: Optional[float] = None, *, velocity: Optional[Sequence[float]] = None
+    ) -> Optional[KernelResult]:
+        """Watchdog. Returns the safe-action decision on timeout/e-stop, else None.
+
+        With ``velocity`` (current Cartesian velocity) the safe action brakes;
+        without it (or if it is invalid) the configured ``safe_action`` is used.
+        """
         t0 = time.perf_counter()
         now = self._now(now)
+        safe = self._safe_action(velocity)
         if self.estopped:
-            return self._emit(self._estop_result("watchdog", now), t0)
+            return self._emit(self._estop_result("watchdog", now, safe=safe), t0, safe)
         silence = now - self._last_valid_time
         if silence > self._config.watchdog_timeout_s:
             return self._emit(
@@ -281,21 +342,31 @@ class SafetyKernel:
                     "reject", "watchdog", (), (C_WATCHDOG,),
                     f"no valid command for {silence:.6g}s "
                     f"> watchdog_timeout_s={self._config.watchdog_timeout_s}",
-                    now,
+                    now, safe=safe,
                 ),
-                t0,
+                t0, safe,
             )
         return None
 
     # -- emergency stop (independent of every learned module) -----------------
 
-    def emergency_stop(self, reason: str = "operator", now: Optional[float] = None) -> KernelResult:
-        """Latch the e-stop. Anyone may stop; only the operator may reset."""
+    def emergency_stop(
+        self,
+        reason: str = "operator",
+        now: Optional[float] = None,
+        *,
+        velocity: Optional[Sequence[float]] = None,
+    ) -> KernelResult:
+        """Latch the e-stop. Anyone may stop; only the operator may reset.
+
+        With ``velocity`` the returned safe action brakes (see :meth:`tick`).
+        """
         t0 = time.perf_counter()
         now = self._now(now)
+        safe = self._safe_action(velocity)
         if self._estop_reason is None:
             self._set("_estop_reason", str(reason) or "unspecified")
-        return self._emit(self._estop_result("estop", now), t0)
+        return self._emit(self._estop_result("estop", now, safe=safe), t0, safe)
 
     def reset_emergency_stop(self, operator_key: str, now: Optional[float] = None) -> bool:
         """Operator API: clear the e-stop latch. Raises PermissionError on a bad key.
@@ -332,37 +403,40 @@ class SafetyKernel:
     def _now(self, now: Optional[float]) -> float:
         return float(self._clock() if now is None else now)
 
-    def _evaluate(self, command: Any, position: Any, velocity: Any, now: float) -> KernelResult:
+    def _evaluate(
+        self, command: Any, position: Any, velocity: Any, now: float, safe: tuple[float, ...]
+    ) -> KernelResult:
         cfg = self._config
+        res = lambda *a, **kw: self._result(*a, safe=safe, **kw)  # noqa: E731
         env, pid, problem = self._parse(command)
         if env is not None:
             self._set("_last_cycle_id", env.cycle_id)
         mid = None if env is None else env.message_id
 
         if self.estopped:
-            return self._estop_result(pid, now, mid)
+            return self._estop_result(pid, now, mid, safe=safe)
         if problem is not None:
-            return self._result("reject", pid, (), (C_MALFORMED,), problem, now, mid)
+            return res("reject", pid, (), (C_MALFORMED,), problem, now, mid)
         try:
             pos = _floats(position, "position", cfg.n_axes)
             vel = _floats(velocity, "velocity", cfg.n_axes)
         except ValueError as exc:
-            return self._result("reject", pid, (), (C_INVALID_STATE,), str(exc), now, mid)
+            return res("reject", pid, (), (C_INVALID_STATE,), str(exc), now, mid)
 
         age = now - env.timestamp
         if age > cfg.max_command_age_s:
-            return self._result(
+            return res(
                 "reject", pid, (), (C_STALE,),
                 f"command age {age:.6g}s > max_command_age_s={cfg.max_command_age_s}",
                 now, mid,
             )
         if age < 0:
-            return self._result(
+            return res(
                 "reject", pid, (), (C_FUTURE,),
                 f"command timestamp {env.timestamp} is after kernel time {now}", now, mid,
             )
         if env.timestamp < self._last_reset_time:
-            return self._result(
+            return res(
                 "reject", pid, (), (C_PRE_RESET,),
                 "command was issued before the last e-stop reset", now, mid,
             )
@@ -377,27 +451,87 @@ class SafetyKernel:
                 violated.append(f"action_limit[{a}]")
             applied.append(min(max(u, lo), hi))
         if violated and cfg.limit_mode == "reject":
-            return self._result(
+            return res(
                 "reject", pid, (), tuple(violated),
                 f"action {action} outside limits on {len(violated)} axis/axes", now, mid,
             )
 
-        dt = cfg.control_dt_s
-        outside = []
-        for i, a in enumerate(cfg.axis_names):
-            p = pos[i] + vel[i] * dt + 0.5 * (applied[i] / cfg.mass_kg) * dt * dt
-            if not cfg.workspace_low[i] <= p <= cfg.workspace_high[i]:
-                outside.append(f"workspace[{a}]")
+        outside, cannot_stop = self._workspace_check(pos, vel, applied)
         if outside:
-            return self._result(
+            return res(
                 "reject", pid, (), tuple(violated + outside),
                 "predicted next position leaves the workspace", now, mid,
+            )
+        if cannot_stop:
+            constraints = tuple(violated + cannot_stop)
+            if cfg.limit_mode == "clamp" and safe != tuple(applied):
+                b_out, b_stop = self._workspace_check(pos, vel, safe)
+                if not b_out and not b_stop:
+                    return res(
+                        "approve", pid, safe, constraints,
+                        "replaced by braking action: body could not stop inside the "
+                        f"workspace on {len(cannot_stop)} axis/axes", now, mid,
+                    )
+            return res(
+                "reject", pid, (), constraints,
+                "body could not stop inside the workspace after this command", now, mid,
             )
 
         reason = (
             f"approved after clamping {len(violated)} axis/axes" if violated else "approved"
         )
-        return self._result("approve", pid, tuple(applied), tuple(violated), reason, now, mid)
+        return res("approve", pid, tuple(applied), tuple(violated), reason, now, mid)
+
+    def _workspace_check(
+        self, pos: Sequence[float], vel: Sequence[float], applied: Sequence[float]
+    ) -> tuple[list[str], list[str]]:
+        """Return (axes whose next position leaves the workspace, axes that could
+        not stop inside the workspace afterwards) for ``applied`` from (pos, vel)."""
+        cfg = self._config
+        dt, m = cfg.control_dt_s, cfg.mass_kg
+        outside, cannot_stop = [], []
+        for i, a in enumerate(cfg.axis_names):
+            lo, hi = cfg.workspace_low[i], cfg.workspace_high[i]
+            acc = applied[i] / m
+            p = pos[i] + vel[i] * dt + 0.5 * acc * dt * dt
+            if not lo <= p <= hi:
+                outside.append(f"workspace[{a}]")
+                continue
+            v = vel[i] + acc * dt
+            if v == 0.0:
+                continue
+            if v > 0:
+                bound, sign, a_brake = hi, 1.0, max(0.0, -cfg.action_low[i]) / m
+            else:
+                bound, sign, a_brake = lo, -1.0, max(0.0, cfg.action_high[i]) / m
+            d_zoh, d_si = _stopping_distances(abs(v), a_brake, dt)
+            p_si = pos[i] + v * dt  # semi-implicit Euler next position
+            slack = _TOL * max(1.0, abs(bound))
+            if not (
+                sign * (p + sign * d_zoh - bound) <= slack
+                and sign * (p_si + sign * d_si - bound) <= slack
+            ):
+                cannot_stop.append(f"stopping[{a}]")
+        return outside, cannot_stop
+
+    def _safe_action(self, velocity: Any) -> tuple[float, ...]:
+        """Braking safe action for ``velocity``; configured safe_action if unknown."""
+        cfg = self._config
+        if velocity is None:
+            return cfg.safe_action
+        try:
+            vel = _floats(velocity, "velocity", cfg.n_axes)
+        except ValueError:
+            return cfg.safe_action
+        out = []
+        for i, v in enumerate(vel):
+            if v == 0.0:
+                out.append(cfg.safe_action[i])
+            else:
+                u = -cfg.mass_kg * v / cfg.control_dt_s
+                out.append(min(max(u, cfg.action_low[i]), cfg.action_high[i]))
+        return tuple(out)
+
 
     def _parse(self, command: Any) -> tuple[Optional[Envelope], str, Optional[str]]:
         """Return (envelope, proposal_id, problem); problem is None when well-formed."""
@@ -433,6 +567,8 @@ class SafetyKernel:
         reason: str,
         now: float,
         message_id: Optional[str] = None,
+        *,
+        safe: Optional[tuple[float, ...]] = None,
     ) -> KernelResult:
         decision = SafetyDecision(
             verdict=verdict,
@@ -444,19 +580,31 @@ class SafetyKernel:
         return KernelResult(
             decision=decision,
             reason=reason,
-            actuator_command=approved if verdict == "approve" else self._config.safe_action,
+            actuator_command=(
+                approved if verdict == "approve"
+                else self._config.safe_action if safe is None else safe
+            ),
             timestamp=now,
             message_id=message_id,
         )
 
-    def _estop_result(self, proposal_id: str, now: float, mid: Optional[str] = None) -> KernelResult:
+    def _estop_result(
+        self,
+        proposal_id: str,
+        now: float,
+        mid: Optional[str] = None,
+        *,
+        safe: Optional[tuple[float, ...]] = None,
+    ) -> KernelResult:
         return self._result(
             "emergency_stop", proposal_id, (), (C_ESTOP,),
             f"emergency stop latched ({self._estop_reason}); operator reset required",
-            now, mid,
+            now, mid, safe=safe,
         )
 
-    def _emit(self, result: KernelResult, t0: float) -> KernelResult:
+    def _emit(
+        self, result: KernelResult, t0: float, safe: Optional[tuple[float, ...]] = None
+    ) -> KernelResult:
         """Log a decision. A logging failure latches the e-stop (fail safe)."""
         d = result.decision
         ok = self._log_event(
@@ -477,7 +625,9 @@ class SafetyKernel:
             return result
         if self._estop_reason is None:
             self._set("_estop_reason", C_TELEMETRY)
-        return self._estop_result(d.proposal_id, result.timestamp, result.message_id)
+        return self._estop_result(
+            d.proposal_id, result.timestamp, result.message_id, safe=safe
+        )
 
     def _log_event(
         self,
