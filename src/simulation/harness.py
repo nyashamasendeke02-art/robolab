@@ -18,9 +18,14 @@ Episodes
 :class:`Puck2D`, :class:`SafetyKernel` and :class:`CycleRunner` (with the policy
 in the runner's ``system1`` slot) that share one :class:`TelemetryLog`, so every
 action reaches the environment only as a kernel ``actuator_command``. The
-kernel's limits are the environment's: action limits = Puck2D force limits,
-``mass_kg`` = initial mass, ``control_dt_s`` = ``dt``; the workspace, command
-age, watchdog timeout and limit mode come from :class:`HarnessConfig`.
+kernel is configured from Puck2D's MHS (``SafetyKernel.from_mhs``, G1-5):
+action limits = Puck2D force limits, ``control_dt_s`` = ``dt``, mass bounds =
+the min / max over the base mass and every mass change in the eval set (a
+fleet-level bound, so the bound does not reveal one task's schedule); the
+workspace, command age, watchdog timeout and limit mode come from
+:class:`HarnessConfig`. The runner receives the same MHS for the brain
+modules. (:meth:`HarnessConfig.safety_config` is the pre-MHS hand
+configuration, kept as the reference the MHS-built kernel is tested against.)
 
 Simulation clock: the runner and the kernel share a :class:`SimClock` that
 reads ``cycle * dt``, with ``cycle`` the 0-based control-cycle index set by the
@@ -29,9 +34,11 @@ returns a result steps Puck2D exactly once, so while every cycle actuates (the
 case for both reference policies) the clock equals ``Puck2D.time`` (episode
 step x dt) at the start of each cycle. A cycle that does not actuate (no
 command and no watchdog result) still consumes one control period, so the
-watchdog sees time pass instead of stalling; such cycles are counted in
-``idle_cycles``. An episode ends when Puck2D terminates or truncates, or after
-``max_steps`` cycles.
+watchdog sees time pass instead of stalling. Since G1-5 every cycle actuates
+(a cycle without a checked command actuates the kernel's braking safe action);
+``idle_cycles`` counts the cycles in which no command was checked by the
+kernel (abstain, module failure, watchdog, e-stop). An episode ends when
+Puck2D terminates or truncates, or after ``max_steps`` cycles.
 
 Ground-truth isolation (G1-4, REQ-ISO): the policy's ``reset`` receives a
 :class:`TaskBrief` (task id and goal: the instruction), never the
@@ -48,7 +55,8 @@ path_length (sum of ground-truth displacement norms), collisions (0/1; Puck2D
 terminates on contact), and safety_interventions: the number of cycles whose
 :class:`KernelResult` was not a clean approval, broken down into clamps
 (approve with violated constraints), rejections, watchdog timeouts and
-emergency stops.
+emergency stops. The kernel's ``no_command`` result (braking on a cycle with
+nothing to check) is not an intervention; it is counted in ``idle_cycles``.
 
 Determinism (REQ-REPRO): environment seeds come from the tasks, the runner's
 Generator is ``default_rng([seed, episode])`` and time is simulated, so the
@@ -68,8 +76,10 @@ from typing import Any, Iterable, Mapping, Optional, Sequence, Union
 
 import numpy as np
 
+from contracts import MHS
 from robot.runner import CycleRunner, Modules
 from safety import KernelResult, SafetyConfig, SafetyKernel
+from safety.kernel import C_NO_COMMAND
 from simulation.puck2d import (
     FrictionPatch,
     Impulse,
@@ -82,7 +92,7 @@ from simulation.puck2d import (
 )
 from state.telemetry import TelemetryLog, TelemetryRecord
 
-HARNESS_VERSION = "episode-harness-0.2.0"
+HARNESS_VERSION = "episode-harness-0.3.0"
 EVAL_SET_VERSION = "puck2d-evalset-0.1.0"
 COMPONENT = "harness"
 
@@ -414,7 +424,18 @@ class HarnessConfig:
     limit_mode: str = "clamp"
     operator_key: str = "harness-operator"
 
+    def mhs(self, env: Puck2D, mass_bounds: Optional[tuple[float, float]] = None) -> MHS:
+        """``env``'s MHS with this config's workspace and command timing."""
+        return env.mhs(
+            workspace_low=self.workspace_low,
+            workspace_high=self.workspace_high,
+            max_command_age_s=self.max_command_age_s,
+            watchdog_timeout_s=self.watchdog_timeout_s,
+            mass_bounds=mass_bounds,
+        )
+
     def safety_config(self, env: Puck2DConfig) -> SafetyConfig:
+        """Hand configuration (pre-MHS reference; exact initial mass)."""
         return SafetyConfig(
             axis_names=("x", "y"),
             action_low=env.force_low,
@@ -426,6 +447,7 @@ class HarnessConfig:
             limit_mode=self.limit_mode,
             mass_kg=env.mass,
             control_dt_s=env.dt,
+            actuator_latency_s=(env.actuator_tau, env.actuator_tau),
         )
 
 
@@ -463,6 +485,14 @@ class EpisodeMetrics:
         return asdict(self)
 
 
+def fleet_mass_bounds(eval_set: EvalSet, task: Optional[TaskInstance] = None) -> tuple[float, float]:
+    """(min, max) over the base mass and every mass change of the eval set (and ``task``)."""
+    base = Puck2DConfig.from_mapping(_thaw(eval_set.env_params)).mass
+    tasks = eval_set.tasks + (() if task is None else (task,))
+    masses = [base, *(mc.mass for t in tasks for mc in t.mass_changes)]
+    return min(masses), max(masses)
+
+
 def classify(result: Optional[KernelResult]) -> Optional[str]:
     """Intervention kind of one cycle's KernelResult, or None for none / clean approval."""
     if result is None:
@@ -472,6 +502,8 @@ def classify(result: Optional[KernelResult]) -> Optional[str]:
         return "clamp" if d.violated_constraints else None
     if d.verdict == "emergency_stop":
         return "emergency_stop"
+    if d.violated_constraints == (C_NO_COMMAND,):
+        return None  # nothing was checked: braking idle cycle, not an intervention
     return "watchdog" if "watchdog_timeout" in d.violated_constraints else "reject"
 
 
@@ -499,7 +531,10 @@ def run_episode(
     env = Puck2D(task.env_config(eval_set.env_params), seed=task.seed)
     ecfg = env.config
     clock = SimClock(ecfg.dt)
-    kernel = SafetyKernel(cfg.safety_config(ecfg), telemetry, cfg.operator_key, clock=clock)
+    mhs = cfg.mhs(env, mass_bounds=fleet_mass_bounds(eval_set, task))
+    kernel = SafetyKernel.from_mhs(
+        mhs, telemetry, cfg.operator_key, clock=clock, limit_mode=cfg.limit_mode
+    )
     reset = getattr(policy, "reset", None)
     if callable(reset):
         reset(TaskBrief.of(task))  # never the TaskInstance: its disturbances are ground truth
@@ -511,6 +546,7 @@ def run_episode(
         Modules(environment=env, system1=policy, **brain),
         clock=clock,
         run_id=ep_id,
+        mhs=mhs,
     )
     policy_version = getattr(policy, "version", type(policy).__name__)
     telemetry.log(
@@ -531,7 +567,7 @@ def run_episode(
         result = runner.step()
         cycles += 1
         path += float(np.hypot(*(env.pos - p0)))
-        if result.actuated_command is None:
+        if result.kernel_source != "check":
             idle += 1
         kind = classify(result.kernel_result)
         if kind is not None:

@@ -69,6 +69,8 @@ class SpyKernel(SafetyKernel):
         self.checked = []
         self.checked_velocity = []
         self.tick_calls = []
+        self.tick_velocity = []
+        self.no_command_calls = []
         super().__init__(*args, **kwargs)
 
     def check(self, command, **kwargs):
@@ -78,11 +80,18 @@ class SpyKernel(SafetyKernel):
         self.results.append(r)
         return r
 
-    def tick(self, now=None):
-        r = super().tick(now)
+    def tick(self, now=None, *, velocity=None):
+        r = super().tick(now, velocity=velocity)
         self.tick_calls.append(now)
+        self.tick_velocity.append(velocity)
         if r is not None:
             self.results.append(r)
+        return r
+
+    def no_command(self, now=None, *, velocity=None, **kw):
+        r = super().no_command(now, velocity=velocity, **kw)
+        self.no_command_calls.append(velocity)
+        self.results.append(r)
         return r
 
 
@@ -305,7 +314,26 @@ def test_clamp_mode_actuates_the_clamped_action(tmp_path):
     tl.close()
 
 
-def test_missing_kinematics_is_rejected_by_kernel(tmp_path):
+def test_missing_observed_kinematics_is_rejected_by_kernel(tmp_path):
+    # G1-5: the kernel reads position/velocity from the raw observation. An
+    # observation without the velocity channels makes the command invalid_state.
+    class NoVelocityEnv(PointMassEnv):
+        def observe(self, rng):
+            return Observation("stub", ("pos_x", "pos_y"), tuple(float(p) for p in self.pos),
+                               Uncertainty())
+
+    runner, kernel, tl, _ = _setup(
+        tmp_path, modules={"system1": FixedS1((1.0, 1.0)), "environment": NoVelocityEnv(Clock())},
+    )
+    (res,) = runner.run(1)
+    assert res.kernel_result.decision.violated_constraints == ("invalid_state",)
+    assert res.actuated_command == (0.0, 0.0)  # unknown velocity: configured safe action
+    tl.close()
+
+
+def test_kernel_ignores_the_state_estimate(tmp_path):
+    # An estimator that drops the kinematics no longer blinds the kernel (it used
+    # to cause invalid_state); the kernel checks the observed state.
     class BadEstimator:
         def estimate(self, observation, rng):
             from contracts import StateUpdate
@@ -316,22 +344,31 @@ def test_missing_kinematics_is_rejected_by_kernel(tmp_path):
         tmp_path, modules={"system1": FixedS1((1.0, 1.0)), "state_estimator": BadEstimator()}
     )
     (res,) = runner.run(1)
-    assert res.kernel_result.decision.violated_constraints == ("invalid_state",)
-    assert res.actuated_command == (0.0, 0.0)
+    assert res.kernel_result.decision.verdict == "approve"
+    assert res.actuated_command == (1.0, 1.0)
     tl.close()
 
 
-def test_kernel_tick_every_cycle_and_watchdog_safe_action_without_commands(tmp_path):
+def test_kernel_tick_every_cycle_and_safe_action_without_commands(tmp_path):
     runner, kernel, tl, clock = _setup(tmp_path)  # NullSystem1: never proposes
     env = runner.modules.environment
+    env.noise = 0.0
+    env.vel = np.array([0.02, -0.01])  # moving slowly
     res = runner.run(2)
-    assert env.actuated == [] and all(r.kernel_result is None for r in res)
+    # No command: the kernel's no_command decision brakes the observed velocity.
+    assert [r.kernel_source for r in res] == ["no_command", "no_command"]
+    assert all(r.kernel_result.decision.violated_constraints == ("no_command",) for r in res)
+    assert env.actuated[0] == pytest.approx((-2.0, 1.0))  # -m v / dt
+    assert np.all(env.vel == 0.0)  # stopped exactly in one step
+    assert [r.actuated_command for r in res] == env.actuated
     clock.t += 1.0  # longer than watchdog_timeout_s
     (r3,) = runner.run(1)
+    assert r3.kernel_source == "tick"
     assert r3.kernel_result.decision.violated_constraints == ("watchdog_timeout",)
-    assert env.actuated == [(0.0, 0.0)]
+    assert env.actuated[-1] == (0.0, 0.0)  # at rest: zero force
     assert r3.actuated_command is r3.kernel_result.actuator_command
     assert len(kernel.tick_calls) == 3  # one watchdog tick per cycle
+    assert kernel.tick_velocity[0] == pytest.approx((0.02, -0.01))  # observed velocity
     tl.close()
 
 
@@ -350,6 +387,9 @@ def test_faulty_module_is_logged_and_no_command_is_sent(tmp_path):
     (res,) = runner.run(1)
     assert res.awareness_decision == "abstain"
     assert kernel.checked == []
+    # ... but the kernel's braking safe action is still actuated.
+    assert res.kernel_source == "no_command"
+    assert runner.modules.environment.actuated == [res.kernel_result.actuator_command]
     errs = [r for r in tl.records() if r.component == C_S1]
     assert errs[0].decision == "error" and errs[0].level == "error"
     assert "policy crashed" in errs[0].reason
@@ -387,14 +427,17 @@ def test_system2_only_on_request_and_plans_are_never_actuated(tmp_path):
     tl2.close()
 
 
-def test_accepting_a_plan_sends_nothing_to_actuators(tmp_path):
+def test_accepting_a_plan_sends_only_the_safe_action_to_actuators(tmp_path):
     runner, kernel, tl, _ = _setup(
         tmp_path,
         modules={"system1": FixedS1((1.0, 0.0)), "system2": CountingS2(),
                  "awareness": PlanSelectingAwareness()},
     )
+    runner.modules.environment.noise = 0.0  # at rest: the braking safe action is zero
     (res,) = runner.run(1)
-    assert kernel.checked == [] and runner.modules.environment.actuated == []
+    assert kernel.checked == []
+    assert res.kernel_source == "no_command"
+    assert runner.modules.environment.actuated == [(0.0, 0.0)]
     tl.close()
 
 

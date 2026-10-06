@@ -2,7 +2,7 @@
 
 One call to :meth:`CycleRunner.step` runs one control cycle::
 
-    watchdog tick -> observe -> state estimate -> world-model predict
+    observe -> watchdog tick -> state estimate -> world-model predict
     -> System 1 propose -> Awareness arbitrate [-> System 2 plan -> re-arbitrate]
     -> Safety Kernel -> actuate -> outcome -> telemetry
 
@@ -19,23 +19,36 @@ Safety (MANDATE: the Safety Kernel is the final authority):
   ``KernelResult.actuator_command`` of a :class:`KernelResult` returned by the
   :class:`SafetyKernel` in the same cycle - from :meth:`SafetyKernel.check` if a
   command was checked this cycle, else from :meth:`SafetyKernel.tick` (watchdog
-  timeout / e-stop safe action). With no kernel result the environment is not
-  actuated (the last approved command stands, as the kernel's ``tick`` contract
-  allows until the watchdog fires);
-* :meth:`SafetyKernel.tick` is called at the start of every cycle;
+  timeout / e-stop safe action), else from :meth:`SafetyKernel.no_command`.
+  Every cycle therefore actuates: a cycle with no approved command (abstain,
+  module failure, watchdog, e-stop, rejection) actuates the kernel's safe
+  action, which brakes the observed velocity, so the body stops instead of
+  coasting (G1-5, APR-0003);
+* :meth:`SafetyKernel.tick` is called every cycle, right after observing, with
+  the observed velocity (as are ``no_command`` and ``emergency_stop``);
 * System 2 output (:class:`PlanProposal`) is never actuated; only the System 1
   :class:`ActionProposal` selected by Awareness ``accept`` is sent to the kernel;
-* the kernel's ``position``/``velocity`` come from the physical-layer state
-  estimate (variables ``pos_<axis>`` / ``vel_<axis>``); missing values are
-  passed as NaN so the kernel rejects the command as ``invalid_state``;
+* safety independence (G1-5): the kernel's ``position``/``velocity`` are read
+  from the environment's raw :class:`Observation` by
+  :meth:`SafetyKernel.observed_kinematics` (channels from the MHS sensor
+  layout), never from the state estimate, so a faulty or learned estimator
+  cannot change what the kernel checks; missing channels read as NaN and the
+  kernel rejects the command as ``invalid_state``;
 * a module that raises is logged at level ``error`` and its output treated as
   absent (no command this cycle); an actuator or runner-telemetry failure
   latches the kernel's emergency stop.
 
+Model Hardware Standard (G1-5, REQ-MHS): the runner takes the body's
+:class:`contracts.MHS` (``mhs=``, default: ``environment.mhs()`` when the
+environment publishes one) and, at construction, hands it to every brain module
+that has a ``bind_mhs(mhs)`` method; brain code reads action and observation
+layouts only from it.
+
 Ground-truth isolation (G1-4, REQ-ISO): brain modules (StateEstimator,
 WorldModel, System1, System2, Awareness) receive only contract messages derived
 from the environment's noisy :class:`Observation`, the previous approved command
-(``PredictionRequest.action``) and the runner's Generator. The
+(``PredictionRequest.action``), the runner's Generator and, once at
+construction, the declared MHS (no true or disturbed parameters). The
 :class:`Outcome` and the environment object are never passed to them. If the
 environment has a ``ground_truth()`` method (e.g. Puck2D's true state,
 parameters and active disturbances), the runner calls it after each actuation
@@ -63,6 +76,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Union, runtime_ch
 import numpy as np
 
 from contracts import (
+    MHS,
     ActionProposal,
     AwarenessDecision,
     Envelope,
@@ -77,7 +91,10 @@ from contracts import (
 from safety import KernelResult, SafetyKernel
 from state.telemetry import TelemetryError, TelemetryLog
 
-RUNNER_VERSION = "cycle-runner-0.2.0"
+RUNNER_VERSION = "cycle-runner-0.3.0"
+
+# Brain slots that receive the MHS via bind_mhs (the environment is the body).
+BRAIN_SLOTS = ("state_estimator", "world_model", "system1", "system2", "awareness")
 
 # Telemetry component names, one per stage.
 C_OBSERVE = "env_observe"
@@ -302,6 +319,8 @@ class CycleResult:
     actuated_command: Optional[tuple[float, ...]]
     outcome: Optional[Outcome]
     latency_ms: Mapping[str, float]
+    # Kernel call that produced kernel_result: "check", "tick" or "no_command".
+    kernel_source: Optional[str] = None
 
 
 class _Failed:
@@ -342,6 +361,7 @@ class CycleRunner:
         modules: Optional[Modules] = None,
         clock: Callable[[], float] = time.time,
         run_id: str = "run",
+        mhs: Optional[MHS] = None,
     ) -> None:
         if not isinstance(kernel, SafetyKernel):
             raise TypeError(f"kernel must be SafetyKernel, got {type(kernel).__name__}")
@@ -362,6 +382,32 @@ class CycleRunner:
         self.cycle_id = 0
         self._event_seq = 0
         self._last_command: tuple[float, ...] = ()
+        self._velocity: Optional[tuple[float, ...]] = None  # last observed, if valid
+        self.mhs = self._resolve_mhs(mhs)
+        if self.mhs is not None:
+            bound = set()
+            for slot in BRAIN_SLOTS:
+                module = getattr(self.modules, slot)
+                bind = getattr(module, "bind_mhs", None)
+                if callable(bind) and id(module) not in bound:
+                    bound.add(id(module))
+                    bind(self.mhs)
+
+    def _resolve_mhs(self, mhs: Optional[MHS]) -> Optional[MHS]:
+        if mhs is None:
+            published = getattr(self.modules.environment, "mhs", None)
+            mhs = published() if callable(published) else None
+        if mhs is None:
+            return None
+        if not isinstance(mhs, MHS):
+            raise TypeError(f"mhs must be MHS, got {type(mhs).__name__}")
+        mhs.validate()
+        if mhs.action_size != self.kernel.config.n_axes:
+            raise ValueError(
+                f"MHS action layout has {mhs.action_size} entries, "
+                f"kernel has {self.kernel.config.n_axes} axes"
+            )
+        return mhs
 
     # -- public API ------------------------------------------------------------
 
@@ -382,15 +428,19 @@ class CycleRunner:
         rng = self.rng
         lat: dict[str, float] = {}
 
-        # Watchdog, every cycle.
-        tick = self.kernel.tick(now=self._now())
-
         decision = "abstain"
         command_env: Optional[Envelope] = None
         state: Optional[StateUpdate] = None
 
         obs = self._stage(C_OBSERVE, m.environment, lat, lambda: m.environment.observe(rng),
                           lambda o: ("observed", {"sensor_id": o.sensor_id}))
+        # Kinematics for the kernel come from the raw observation, not the estimate.
+        pos, vel = self.kernel.observed_kinematics(None if isinstance(obs, _Failed) else obs)
+        self._velocity = vel if all(math.isfinite(v) for v in vel) else None
+
+        # Watchdog, every cycle; with the observed velocity its safe action brakes.
+        tick = self.kernel.tick(now=self._now(), velocity=self._velocity)
+
         if not isinstance(obs, _Failed):
             state = self._stage(
                 C_ESTIMATE, m.state_estimator, lat,
@@ -402,45 +452,49 @@ class CycleRunner:
         else:
             state = None
 
-        # Safety Kernel: the only source of actuator commands.
-        kernel_result: Optional[KernelResult] = tick
+        # Safety Kernel: the only source of actuator commands. A cycle without a
+        # command still actuates the kernel's (braking) safe action.
         if command_env is not None:
-            pos, vel = self._kinematics(state)
+            source = "check"
             kernel_result = self.kernel.check(
                 command_env, position=pos, velocity=vel, now=self._now()
             )
-
-        actuated: Optional[tuple[float, ...]] = None
-        outcome: Optional[Outcome] = None
-        if kernel_result is not None:
-            command = kernel_result.actuator_command
-            outcome = self._stage(
-                C_ACTUATE, m.environment, lat, lambda: m.environment.actuate(command, rng),
-                lambda o: ("actuated", {
-                    "command": list(command), "success": o.success, "reward": o.reward,
-                    **_ground_truth(m.environment),
-                }),
+        elif tick is not None:
+            source, kernel_result = "tick", tick
+        else:
+            source = "no_command"
+            kernel_result = self.kernel.no_command(
+                now=self._now(), velocity=self._velocity,
+                reason=f"no command this cycle (awareness: {decision})",
             )
-            if isinstance(outcome, _Failed):
-                outcome = None
-                self.kernel.emergency_stop("actuator failure", now=self._now())
-            actuated = command
-            self._last_command = command
+
+        command = kernel_result.actuator_command
+        outcome = self._stage(
+            C_ACTUATE, m.environment, lat, lambda: m.environment.actuate(command, rng),
+            lambda o: ("actuated", {
+                "command": list(command), "success": o.success, "reward": o.reward,
+                **_ground_truth(m.environment),
+            }),
+        )
+        if isinstance(outcome, _Failed):
+            outcome = None
+            self.kernel.emergency_stop(
+                "actuator failure", now=self._now(), velocity=self._velocity
+            )
+        self._last_command = command
 
         total = (time.perf_counter() - t_cycle) * 1000.0
-        verdict = None if kernel_result is None else kernel_result.decision.verdict
         self._log(
             C_CYCLE, RUNNER_VERSION, decision,
             "cycle complete", total,
             data={
-                "kernel_verdict": verdict,
-                "kernel_source": None if kernel_result is None
-                else ("check" if command_env is not None else "tick"),
-                "actuated_command": None if actuated is None else list(actuated),
+                "kernel_verdict": kernel_result.decision.verdict,
+                "kernel_source": source,
+                "actuated_command": list(command),
             },
         )
         lat[C_CYCLE] = total
-        return CycleResult(cid, decision, kernel_result, actuated, outcome, lat)
+        return CycleResult(cid, decision, kernel_result, command, outcome, lat, source)
 
     # -- internals ---------------------------------------------------------------
 
@@ -535,15 +589,6 @@ class CycleRunner:
         self._log(component, _version(module), decision, reason, ms, data=data, level=level)
         return out
 
-    def _kinematics(self, state: Optional[StateUpdate]) -> tuple[tuple[float, ...], tuple[float, ...]]:
-        axes = self.kernel.config.axis_names
-        values: dict[str, float] = {}
-        if state is not None and state.layer == "physical":
-            values = dict(zip(state.variables, state.values))
-        pos = tuple(values.get(f"pos_{a}", math.nan) for a in axes)
-        vel = tuple(values.get(f"vel_{a}", math.nan) for a in axes)
-        return pos, vel
-
     def _now(self) -> float:
         return float(self.clock())
 
@@ -565,5 +610,7 @@ class CycleRunner:
             )
         except (TelemetryError, ValueError, OSError) as exc:
             # Unobservable control is not safe: stop, then refuse to continue.
-            self.kernel.emergency_stop("runner telemetry failure", now=self._now())
+            self.kernel.emergency_stop(
+                "runner telemetry failure", now=self._now(), velocity=self._velocity
+            )
             raise RunnerError(f"runner telemetry failed: {exc}") from exc

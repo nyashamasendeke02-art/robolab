@@ -3,8 +3,22 @@
 Implementation: `src/contracts/messages.py` (import as `from contracts import ...`).
 Mandate refs: Gate 0, REQ-LOG, REQ-STATE, ADR-001 (docs/MANDATE.md, "Contracts").
 
-Current schema version: **`1.0.0`** (`contracts.SCHEMA_VERSION`). Any change to a class
+Current schema version: **`1.1.0`** (`contracts.SCHEMA_VERSION`). Any change to a class
 or field below must bump the version and update this document.
+
+Version history:
+
+- `1.0.0` - the 13 payload classes, `Envelope` and `Uncertainty` (Gate 0).
+- `1.1.0` - adds the Model Hardware Standard (`contracts.MHS` and its parts `Actuator`,
+  `Sensor`, `NoiseModel`, `Body`, `Footprint`, `Control`, `SafetyEnvelope`; G1-5,
+  ENG-0012), versioned separately by `contracts.MHS_VERSION` and documented in
+  [`docs/mhs.md`](mhs.md). The message classes below are unchanged; envelopes written
+  under `1.0.0` are rejected by the version check, as for any schema change.
+
+The MHS is not a message (it is never wrapped in an `Envelope`): it is the declared
+description of a body, read once at construction by the Safety Kernel
+(`SafetyKernel.from_mhs`) and handed to brain modules by the cycle runner. It uses the
+same validation and JSON rules as the messages (see General rules).
 
 ## General rules
 

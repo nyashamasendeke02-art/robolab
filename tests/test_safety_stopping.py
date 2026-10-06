@@ -57,7 +57,7 @@ def tl(tmp_path):
 
 
 def test_kernel_version_bumped():
-    assert KERNEL_VERSION == "safety-kernel-1.1.0"
+    assert KERNEL_VERSION == "safety-kernel-1.2.0"  # v1.2: ENG-0012 (MHS, mass bounds)
 
 
 # AC 1: the review case ------------------------------------------------------

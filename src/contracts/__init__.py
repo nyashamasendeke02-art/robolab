@@ -1,4 +1,4 @@
-"""contracts (see docs/MANDATE.md and docs/contracts.md)."""
+"""contracts (see docs/MANDATE.md, docs/contracts.md and docs/mhs.md)."""
 
 from contracts.messages import (
     AWARENESS_DECISIONS,
@@ -26,30 +26,50 @@ from contracts.messages import (
     StateUpdate,
     Uncertainty,
 )
+from contracts.mhs import (
+    MHS,
+    MHS_VERSION,
+    Actuator,
+    Body,
+    Control,
+    Footprint,
+    NoiseModel,
+    SafetyEnvelope,
+    Sensor,
+)
 
 __all__ = [
     "AWARENESS_DECISIONS",
     "EXPERIMENT_EVENT_KINDS",
     "LEARNING_EVENT_KINDS",
     "MEMORY_QUERY_KINDS",
+    "MHS",
+    "MHS_VERSION",
     "PAYLOAD_TYPES",
     "SAFETY_VERDICTS",
     "SCHEMA_VERSION",
     "STATE_LAYERS",
     "ActionProposal",
+    "Actuator",
     "AwarenessDecision",
+    "Body",
     "ContractError",
+    "Control",
     "Envelope",
     "ExperimentEvent",
+    "Footprint",
     "LearningEvent",
     "MemoryQuery",
     "MemoryResult",
+    "NoiseModel",
     "Observation",
     "Outcome",
     "PlanProposal",
     "PredictionRequest",
     "PredictionResult",
     "SafetyDecision",
+    "SafetyEnvelope",
+    "Sensor",
     "StateUpdate",
     "Uncertainty",
 ]

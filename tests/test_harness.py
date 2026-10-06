@@ -210,7 +210,8 @@ def test_idle_policy_still_advances_time_and_trips_watchdog(tmp_path):
         m = run_episode(es, task, Idle(), log, seed=0)
     assert m.cycles == 50
     assert m.watchdog_timeouts > 0
-    assert m.idle_cycles + m.steps == m.cycles
+    # G1-5: every cycle actuates the kernel's safe action; none checked a command.
+    assert m.steps == m.cycles and m.idle_cycles == m.cycles
     assert m.truncated and not m.success
 
 

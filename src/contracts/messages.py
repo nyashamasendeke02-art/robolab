@@ -24,7 +24,7 @@ import typing
 from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"  # 1.1.0: Model Hardware Standard (contracts.mhs, ENG-0012)
 
 
 class ContractError(ValueError):
