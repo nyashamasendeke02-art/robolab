@@ -1,0 +1,10 @@
+{
+  "pd": {
+    "factory": "simulation.policies:PDController",
+    "kwargs": {"kp": 20.0, "kd": 8.0, "max_force": 10.0}
+  },
+  "random": {
+    "factory": "simulation.policies:RandomPolicy",
+    "kwargs": {"low": [-10.0, -10.0], "high": [10.0, 10.0]}
+  }
+}
