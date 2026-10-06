@@ -447,6 +447,7 @@ class HarnessConfig:
             limit_mode=self.limit_mode,
             mass_kg=env.mass,
             control_dt_s=env.dt,
+            actuator_latency_s=(env.actuator_tau, env.actuator_tau),
         )
 
 

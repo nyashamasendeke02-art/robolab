@@ -274,6 +274,52 @@ def test_kernel_from_mhs_behaves_identically(tmp_path, env_kw, limit_mode):
     assert {"approve", "reject"} <= verdicts
 
 
+def test_kernel_takes_the_declared_actuator_latency_from_the_mhs(tmp_path):
+    assert SafetyConfig.from_mhs(Puck2D().mhs()).actuator_latency_s == (0.0, 0.0)
+    env = Puck2D(Puck2DConfig(actuator_tau=1.0))
+    assert SafetyConfig.from_mhs(env.mhs()).actuator_latency_s == (1.0, 1.0)
+    with TelemetryLog(tmp_path / "k.jsonl") as log:
+        lagged = SafetyKernel.from_mhs(env.mhs(), log, KEY, clock=lambda: T0)
+        prompt = SafetyKernel.from_mhs(Puck2D().mhs(), log, KEY, clock=lambda: T0)
+        # Coasting at 0.5 m/s, 5 cm from x=2: stoppable at once, not after a 1 s latency.
+        r = lagged.check(_cmd((0.0, 0.0), T0, 1), position=(1.95, 0.0), velocity=(0.5, 0.0), now=T0)
+        assert r.decision.verdict == "reject" and "stopping[x]" in r.decision.violated_constraints
+        r = prompt.check(_cmd((0.0, 0.0), T0, 2), position=(1.95, 0.0), velocity=(0.5, 0.0), now=T0)
+        assert r.decision.verdict == "approve"
+        with pytest.raises(ValueError):
+            SafetyConfig(("x",), (-1.0,), (1.0,), (-1.0,), (1.0,), 0.05, 0.1, actuator_latency_s=(-0.1,))
+
+
+def test_lagged_puck_approved_commands_stay_stoppable(tmp_path):
+    # Empirical check of the latency model against Puck2D's first-order lag: from a
+    # random state and random in-flight force, an approved command followed by the
+    # braking safe action keeps the puck inside the workspace.
+    tau, ws = 0.06, 1.0
+    env = Puck2D(Puck2DConfig(actuator_tau=tau, goal=(9.0, 9.0), max_steps=10_000))
+    hc = HarnessConfig(workspace_low=(-ws, -ws), workspace_high=(ws, ws))
+    rng = np.random.default_rng(5)
+    approved = 0
+    with TelemetryLog(tmp_path / "k.jsonl", clock=lambda: T0) as log:
+        k = SafetyKernel.from_mhs(hc.mhs(env), log, KEY, clock=lambda: T0)
+        for i in range(400):
+            pos = rng.uniform(-ws, ws, 2)
+            vel = rng.uniform(-1.0, 1.0, 2)
+            r = k.check(_cmd(rng.uniform(-10.0, 10.0, 2), T0, i),
+                        position=tuple(pos), velocity=tuple(vel), now=T0)
+            if r.decision.verdict != "approve":
+                continue
+            approved += 1
+            env.reset(0)
+            env.pos, env.vel = pos.copy(), vel.copy()
+            env.force = rng.uniform(-10.0, 10.0, 2)  # unknown in-flight force
+            command = r.actuator_command
+            for _ in range(300):
+                env.step(command)
+                assert np.all(np.abs(env.pos) <= ws + 1e-9), (i, env.pos)
+                command = k.tick(now=T0 + 1.0, velocity=tuple(env.vel)).actuator_command
+    assert approved > 20
+
+
 def test_kernel_reads_channels_declared_by_the_mhs(tmp_path):
     # No per-body code: renamed sensors are found through the MHS layout.
     m = Puck2D().mhs()

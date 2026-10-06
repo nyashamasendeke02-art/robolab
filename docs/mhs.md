@@ -149,11 +149,22 @@ observe what it enforces).
 actuators in action-layout order; workspace; `max_command_age_s`,
 `watchdog_timeout_s`, `control_dt_s` = `period_s`; `mass_kg` (upper) and
 `mass_lower_kg`; `max_speed`; `brake_decel`; `safe_action`; position / velocity
-channels via `MHS.channel`. It raises `ContractError` for an MHS outside the kernel's
+channels via `MHS.channel`; `actuator_latency_s` = each action actuator's `latency_s`. It raises `ContractError` for an MHS outside the kernel's
 model: the action layout must be one `force` actuator per workspace axis, in
 workspace-axis order, in the workspace frame; `braking == "actuators"`; e-stop
 latching, operator reset, `brake`. Not modelled by the kernel (documented, not
-rejected): actuator `latency_s` / `rate_limit`, sensor noise, impulses.
+rejected): actuator `rate_limit`, sensor noise, impulses.
+
+Actuator latency: a command, and the braking after it, takes effect only `latency_s`
+after it is issued; until then the actuators keep an earlier force the kernel does
+not know. Per workspace bound the kernel advances the body `ceil(latency_s / dt)`
+periods under the action limit pushing towards that bound (zero if none does), then
+runs the command-step, workspace and stopping checks from there. A bound crossed in
+that time is `stopping[axis]`. This bounds a dead time of at most `latency_s`; for a
+first-order lag of time constant `latency_s` (Puck2D) it is an approximation, not a
+proof. `latency_s = 0` gives exactly the checks without latency. A large latency
+relative to the workspace margin makes the kernel reject nearly every command (safe,
+but the body can then only brake).
 
 Mass interval: the command step is predicted at both mass bounds; braking
 deceleration uses the upper bound; the braking safe action's final reduced step uses

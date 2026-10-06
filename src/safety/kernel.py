@@ -69,8 +69,9 @@ plant discretisation. An axis that cannot brake in the direction of motion
 (``a_brake == 0``) fails the check whenever ``v' != 0`` towards a bound.
 Comparisons allow ``_TOL`` relative rounding slack (about 1e-12 of the bound),
 so that exactly-tight stops computed in floating point are not rejected.
-Not modelled: actuator lag, impulses, mass changes, a ``mass_kg`` lower than
-the true mass, or a plant period different from ``control_dt_s``.
+Not modelled: impulses, actuator rate limits, a ``mass_kg`` lower than the
+true mass, or a plant period different from ``control_dt_s``. Actuator latency
+is modelled from v1.2 on (see below).
 
 Watchdog: :meth:`SafetyKernel.tick` must be called periodically; when no
 command has been approved for longer than ``watchdog_timeout_s`` it returns a
@@ -102,6 +103,19 @@ v1.2 (ENG-0012, G1-5, APR-0003):
   is exactly the v1.1 computation.
 * ``max_speed`` (optional, per axis): the predicted speed after the command
   must not exceed it (constraint ``speed[axis]``; handled like ``stopping``).
+* Actuator latency (``actuator_latency_s`` per axis, from the MHS actuators'
+  ``latency_s``; default 0): a command (and the braking that follows it) can
+  only take effect ``L`` seconds after it is issued. Until then the actuators
+  keep applying an earlier force the kernel does not know, so it is taken as
+  the worst case, the action limit pushing towards the bound being checked
+  (or zero if no limit pushes that way). Per bound, the body is advanced
+  ``ceil(L/dt)`` control periods under that force (semi-implicit Euler, the
+  farther of the two integrations here) and the command step, workspace and
+  stopping checks above then start from that state; a bound crossed during
+  the latency fails as ``stopping[axis]``. This is exact for a dead time of
+  at most ``L``; a first-order lag with time constant ``L`` (Puck2D's
+  ``actuator_tau``) is approximated by it, not proven to be bounded by it.
+  With ``L == 0`` every check is exactly the computation without latency.
 * :meth:`SafetyKernel.no_command`: the decision for a cycle with no command
   to check (abstain, module failure): ``reject`` with constraint
   ``no_command`` and the braking safe action (or the e-stop decision). It does
@@ -217,6 +231,7 @@ class SafetyConfig:
     brake_decel: Optional[tuple[float, ...]] = None  # m/s^2 per axis cap; None: actuators
     position_channels: Optional[tuple[str, ...]] = None  # default: pos_<axis>
     velocity_channels: Optional[tuple[str, ...]] = None  # default: vel_<axis>
+    actuator_latency_s: Optional[tuple[float, ...]] = None  # s per axis; None: no latency
 
     def __post_init__(self) -> None:
         names = tuple(self.axis_names)
@@ -237,6 +252,10 @@ class SafetyConfig:
             "brake_decel": (
                 None if self.brake_decel is None
                 else _floats(self.brake_decel, "brake_decel", n)
+            ),
+            "actuator_latency_s": (
+                (0.0,) * n if self.actuator_latency_s is None
+                else _floats(self.actuator_latency_s, "actuator_latency_s", n)
             ),
             "position_channels": _channels(self.position_channels, "pos", names),
             "velocity_channels": _channels(self.velocity_channels, "vel", names),
@@ -274,6 +293,8 @@ class SafetyConfig:
             raise ValueError("max_speed must be > 0")
         if self.brake_decel is not None and not all(b >= 0 for b in self.brake_decel):
             raise ValueError("brake_decel must be >= 0")
+        if not all(lat >= 0 for lat in self.actuator_latency_s):
+            raise ValueError("actuator_latency_s must be >= 0")
         channels = self.position_channels + self.velocity_channels
         if len(set(channels)) != len(channels):
             raise ValueError(f"position/velocity channels must be unique, got {channels}")
@@ -331,6 +352,7 @@ class SafetyConfig:
             brake_decel=env.brake_decel_mps2,
             position_channels=tuple(mhs.channel("position", a) for a in axes),
             velocity_channels=tuple(mhs.channel("velocity", a) for a in axes),
+            actuator_latency_s=tuple(a.latency_s for a in acts),
         )
 
 
@@ -704,7 +726,35 @@ class SafetyKernel:
         self, i: int, p0: float, v0: float, u: float, m: float, q: float
     ) -> set[str]:
         """Failed checks ("outside", "speed", "stop") on axis ``i`` for force ``u``
-        applied to mass ``m``; braking always uses the upper mass bound."""
+        applied to mass ``m``; braking always uses the upper mass bound. With an
+        actuator latency the checks start after it, once per bound, under the
+        unknown earlier force taken as the limit pushing towards that bound."""
+        cfg = self._config
+        latency = cfg.actuator_latency_s[i]
+        if latency == 0.0:
+            return self._axis_check_now(i, p0, v0, u, m, q)
+        dt = cfg.control_dt_s
+        n = math.ceil(latency / dt - _TOL)  # control periods before the command acts
+        found: set[str] = set()
+        for f_adv, bound, sign in (
+            (max(0.0, cfg.action_high[i]), cfg.workspace_high[i], 1.0),
+            (min(0.0, cfg.action_low[i]), cfg.workspace_low[i], -1.0),
+        ):
+            a = f_adv / m
+            # n semi-implicit Euler steps (>= the zero-order-hold distance towards the bound).
+            p_l = p0 + n * dt * v0 + a * dt * dt * n * (n + 1) / 2.0
+            v_l = v0 + a * n * dt
+            if sign * (p_l - bound) > _TOL * max(1.0, abs(bound)):
+                found.add("stop")
+                continue
+            found |= {"stop" if f == "outside" else f
+                      for f in self._axis_check_now(i, p_l, v_l, u, m, q)}
+        return found
+
+    def _axis_check_now(
+        self, i: int, p0: float, v0: float, u: float, m: float, q: float
+    ) -> set[str]:
+        """:meth:`_axis_check` for a command that acts immediately."""
         cfg = self._config
         dt = cfg.control_dt_s
         lo, hi = cfg.workspace_low[i], cfg.workspace_high[i]
