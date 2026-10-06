@@ -32,6 +32,16 @@ Safety (MANDATE: the Safety Kernel is the final authority):
   absent (no command this cycle); an actuator or runner-telemetry failure
   latches the kernel's emergency stop.
 
+Ground-truth isolation (G1-4, REQ-ISO): brain modules (StateEstimator,
+WorldModel, System1, System2, Awareness) receive only contract messages derived
+from the environment's noisy :class:`Observation`, the previous approved command
+(``PredictionRequest.action``) and the runner's Generator. The
+:class:`Outcome` and the environment object are never passed to them. If the
+environment has a ``ground_truth()`` method (e.g. Puck2D's true state,
+parameters and active disturbances), the runner calls it after each actuation
+and writes the result only to telemetry, under the ``ground_truth`` key of the
+``env_actuate`` record; no module call receives telemetry.
+
 Determinism: the runner holds no global state; all randomness comes from the
 ``numpy.random.Generator`` given at construction, which is passed to every
 module call in a fixed order. Message and runner event ids are derived from
@@ -67,7 +77,7 @@ from contracts import (
 from safety import KernelResult, SafetyKernel
 from state.telemetry import TelemetryError, TelemetryLog
 
-RUNNER_VERSION = "cycle-runner-0.1.0"
+RUNNER_VERSION = "cycle-runner-0.2.0"
 
 # Telemetry component names, one per stage.
 C_OBSERVE = "env_observe"
@@ -301,6 +311,21 @@ class _Failed:
         self.exc = exc
 
 
+def _ground_truth(environment: Any) -> dict[str, Any]:
+    """``{"ground_truth": ...}`` for telemetry only (G1-4); ``{}`` if the environment has none.
+
+    A failing ``ground_truth()`` is recorded, not raised: it must not turn a
+    successful actuation into an actuator failure.
+    """
+    fn = getattr(environment, "ground_truth", None)
+    if not callable(fn):
+        return {}
+    try:
+        return {"ground_truth": fn()}
+    except Exception as exc:
+        return {"ground_truth": None, "ground_truth_error": f"{type(exc).__name__}: {exc}"}
+
+
 def _version(module: Any) -> str:
     v = getattr(module, "version", None)
     return v if isinstance(v, str) and v else type(module).__name__
@@ -393,6 +418,7 @@ class CycleRunner:
                 C_ACTUATE, m.environment, lat, lambda: m.environment.actuate(command, rng),
                 lambda o: ("actuated", {
                     "command": list(command), "success": o.success, "reward": o.reward,
+                    **_ground_truth(m.environment),
                 }),
             )
             if isinstance(outcome, _Failed):

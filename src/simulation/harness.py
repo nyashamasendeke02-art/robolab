@@ -33,6 +33,15 @@ watchdog sees time pass instead of stalling; such cycles are counted in
 ``idle_cycles``. An episode ends when Puck2D terminates or truncates, or after
 ``max_steps`` cycles.
 
+Ground-truth isolation (G1-4, REQ-ISO): the policy's ``reset`` receives a
+:class:`TaskBrief` (task id and goal: the instruction), never the
+:class:`TaskInstance`, whose obstacles and disturbance schedule are ground
+truth. Optional extra brain modules (``brain``: state_estimator, world_model,
+system2, awareness) go into the runner, which passes them only
+observation-derived messages. Ground truth (``Puck2D.ground_truth``) is used for
+the metrics below and logged under ``ground_truth`` (episode start record and
+the runner's ``env_actuate`` records).
+
 Metrics per episode (:class:`EpisodeMetrics`): success (goal reached), steps
 (Puck2D steps), time_to_goal (``steps * dt`` on success, else ``None``),
 path_length (sum of ground-truth displacement norms), collisions (0/1; Puck2D
@@ -73,12 +82,14 @@ from simulation.puck2d import (
 )
 from state.telemetry import TelemetryLog, TelemetryRecord
 
-HARNESS_VERSION = "episode-harness-0.1.0"
+HARNESS_VERSION = "episode-harness-0.2.0"
 EVAL_SET_VERSION = "puck2d-evalset-0.1.0"
 COMPONENT = "harness"
 
 # Puck2D fields owned by a TaskInstance (not allowed in EvalSet.env_params).
 TASK_FIELDS = ("start_pos", "goal", "obstacles", "impulses", "mass_changes", "friction_patches")
+# Runner slots the harness lets a caller fill besides environment and system1.
+BRAIN_SLOTS = ("state_estimator", "world_model", "system2", "awareness")
 
 
 def _json_normal(value: Any) -> Any:
@@ -165,6 +176,22 @@ class TaskInstance:
     def from_dict(cls, raw: Mapping[str, Any]) -> "TaskInstance":
         _check_keys(raw, cls, "TaskInstance")
         return cls(**raw)
+
+
+@dataclass(frozen=True)
+class TaskBrief:
+    """What a brain module may know about a task: its id and goal (G1-4).
+
+    No start state, obstacles, disturbances or physics parameters: those are
+    ground truth the brain must learn from consequences.
+    """
+
+    task_id: str
+    goal: tuple[float, float]
+
+    @classmethod
+    def of(cls, task: TaskInstance) -> "TaskBrief":
+        return cls(task.task_id, task.goal)
 
 
 @dataclass(frozen=True)
@@ -458,22 +485,30 @@ def run_episode(
     episode: int = 0,
     config: Optional[HarnessConfig] = None,
     run_id: str = "harness",
+    brain: Optional[Mapping[str, Any]] = None,
 ) -> EpisodeMetrics:
-    """Run one episode of ``task`` with ``policy`` as System 1 through the cycle runner."""
+    """Run one episode of ``task`` with ``policy`` as System 1 through the cycle runner.
+
+    ``brain`` optionally fills the other runner slots (:data:`BRAIN_SLOTS`).
+    """
     cfg = HarnessConfig() if config is None else config
+    brain = dict(brain or {})
+    bad = sorted(set(brain) - set(BRAIN_SLOTS))
+    if bad:
+        raise ValueError(f"brain slot(s) {bad} not allowed; allowed: {list(BRAIN_SLOTS)}")
     env = Puck2D(task.env_config(eval_set.env_params), seed=task.seed)
     ecfg = env.config
     clock = SimClock(ecfg.dt)
     kernel = SafetyKernel(cfg.safety_config(ecfg), telemetry, cfg.operator_key, clock=clock)
     reset = getattr(policy, "reset", None)
     if callable(reset):
-        reset(task)
+        reset(TaskBrief.of(task))  # never the TaskInstance: its disturbances are ground truth
     ep_id = f"{run_id}-ep{episode}"
     runner = CycleRunner(
         kernel,
         telemetry,
         np.random.default_rng([seed, episode]),
-        Modules(environment=env, system1=policy),
+        Modules(environment=env, system1=policy, **brain),
         clock=clock,
         run_id=ep_id,
     )
@@ -483,7 +518,8 @@ def run_episode(
         model_version=HARNESS_VERSION, event_id=f"{ep_id}-start", timestamp=clock(),
         data={"episode": episode, "task_id": task.task_id, "env_seed": task.seed,
               "runner_seed": [seed, episode], "policy_version": policy_version,
-              "eval_set": eval_set.name, "eval_set_version": eval_set.version},
+              "eval_set": eval_set.name, "eval_set_version": eval_set.version,
+              "ground_truth": env.ground_truth()},
     )
 
     counts = {"clamp": 0, "reject": 0, "watchdog": 0, "emergency_stop": 0}
@@ -539,6 +575,7 @@ def run_episodes(
     n_episodes: Optional[int] = None,
     config: Optional[HarnessConfig] = None,
     run_id: str = "harness",
+    brain: Optional[Mapping[str, Any]] = None,
 ) -> list[EpisodeMetrics]:
     """Run ``n_episodes`` (default: one per task); episode ``i`` uses task ``i % len``."""
     if not eval_set.tasks:
@@ -548,7 +585,7 @@ def run_episodes(
         raise ValueError(f"n_episodes must be a non-negative int, got {n_episodes!r}")
     return [
         run_episode(eval_set, eval_set.tasks[i % len(eval_set.tasks)], policy, telemetry,
-                    seed=seed, episode=i, config=config, run_id=run_id)
+                    seed=seed, episode=i, config=config, run_id=run_id, brain=brain)
         for i in range(n)
     ]
 

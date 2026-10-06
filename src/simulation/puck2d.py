@@ -34,7 +34,8 @@ replaces ``mu`` inside a disc or axis-aligned box.
 
 Observation: ``(pos_x, pos_y, vel_x, vel_y)`` plus independent Gaussian noise
 (``pos_noise_std``, ``vel_noise_std``), drawn once per step / reset. Ground
-truth and the active disturbances are only in ``info``.
+truth and the active disturbances are only in ``info`` (and its copy
+:meth:`Puck2D.ground_truth`), which brain modules never receive (G1-4).
 
 Determinism: all randomness (initial-state noise, sensor noise) comes from the
 instance's ``numpy.random.Generator``, created by :meth:`reset` from its seed;
@@ -53,6 +54,7 @@ the runner clock offset.
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field, fields
 from typing import Any, Mapping, Optional, Union
@@ -304,7 +306,9 @@ class Puck2D:
         self.goal_reached = False
         self.collision: Optional[int] = None
         self._obs = self._draw_obs()
-        return self._obs.copy(), self._info([], cfg.friction, None)
+        info = self._info([], cfg.friction, None)
+        self._last_info = copy.deepcopy(info)
+        return self._obs.copy(), info
 
     def step(
         self, action: Any
@@ -365,12 +369,21 @@ class Puck2D:
         self._obs = self._draw_obs()
         info = self._info(active, mu, u_clipped)
         info["action_clipped"] = clipped
+        self._last_info = copy.deepcopy(info)
         return self._obs.copy(), float(reward), self.terminated, self.truncated, info
 
     @property
     def time(self) -> float:
         """Simulated time of the current state, ``steps * dt`` seconds."""
         return self.steps * self.config.dt
+
+    def ground_truth(self) -> dict[str, Any]:
+        """A copy of the latest ``info`` (true state, parameters, active disturbances).
+
+        For harness metrics and telemetry only (G1-4): the cycle runner logs it
+        under a ``ground_truth`` key and never passes it to a brain module.
+        """
+        return copy.deepcopy(self._last_info)
 
     # -- robot.runner.Environment ------------------------------------------------
 

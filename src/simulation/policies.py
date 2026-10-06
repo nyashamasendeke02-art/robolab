@@ -2,7 +2,7 @@
 
 Both policies implement :class:`robot.runner.System1` (they plug into the cycle
 runner's ``system1`` slot) plus ``reset(task)``, which the episode harness calls
-before every episode:
+before every episode with a ``TaskBrief`` (task id and goal only, G1-4):
 
 * :class:`RandomPolicy` - a uniform random 2D force in ``[force_low, force_high]``
   per axis, drawn from the runner's Generator (the instrument's lower bound);
