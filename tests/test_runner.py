@@ -67,12 +67,14 @@ class SpyKernel(SafetyKernel):
         # Set before SafetyKernel seals itself; later only mutated, never rebound.
         self.results = []
         self.checked = []
+        self.checked_velocity = []
         self.tick_calls = []
         super().__init__(*args, **kwargs)
 
     def check(self, command, **kwargs):
         r = super().check(command, **kwargs)
         self.checked.append(command)
+        self.checked_velocity.append(tuple(kwargs["velocity"]))
         self.results.append(r)
         return r
 
@@ -271,15 +273,22 @@ def test_every_actuated_command_came_from_a_kernel_result(tmp_path):
     assert [c.payload for c in kernel.checked] == s1.proposals
     for cmd in env.actuated:
         assert all(-10.0 <= u <= 10.0 for u in cmd)
-    # Out-of-limit proposals existed and were replaced by the safe action.
-    rejected = [r for r in results if r.kernel_result.decision.verdict == "reject"]
+    # Out-of-limit proposals existed and were replaced by the safe action, which
+    # since kernel v1.1 brakes the measured velocity: clip(-m v / dt, limits).
+    rejected = [
+        (r, v) for r, v in zip(results, kernel.checked_velocity)
+        if r.kernel_result.decision.verdict == "reject"
+    ]
     assert rejected
-    assert all(r.actuated_command == (0.0, 0.0) for r in rejected)
+    for r, vel in rejected:
+        assert r.actuated_command == tuple(min(max(-v / DT, -10.0), 10.0) for v in vel)
     tl.close()
 
 
 def test_out_of_limit_action_never_reaches_environment(tmp_path):
+    # Noise-free body at rest: the braking safe action is zero force.
     runner, kernel, tl, _ = _setup(tmp_path, modules={"system1": FixedS1((50.0, 0.0))})
+    runner.modules.environment.noise = 0.0
     runner.run(5)
     env = runner.modules.environment
     assert env.actuated == [(0.0, 0.0)] * 5
@@ -328,6 +337,7 @@ def test_kernel_tick_every_cycle_and_watchdog_safe_action_without_commands(tmp_p
 
 def test_emergency_stop_blocks_commands(tmp_path):
     runner, kernel, tl, _ = _setup(tmp_path, modules={"system1": FixedS1((1.0, 0.0))})
+    runner.modules.environment.noise = 0.0  # body at rest: braking safe action is zero
     kernel.emergency_stop("test")
     res = runner.run(3)
     assert all(r.kernel_result.decision.verdict == "emergency_stop" for r in res)
